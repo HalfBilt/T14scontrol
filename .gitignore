@@ -1,0 +1,9 @@
+# 运行时生成的本地文件
+config.json
+config.json.broken
+fan_control.log
+fan_control.log.*
+__pycache__/
+build/
+dist/
+*.pyc
