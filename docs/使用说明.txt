@@ -7,9 +7,11 @@ FanControl —— ThinkPad T14s Gen 4 专用智能风扇
   1. 双击 FanControl.exe  →  UAC 弹窗点"是"（自动请求管理员权限）
   2. 托盘出现风扇图标 = 接管成功
 
-【开机自启（可选）】
-  双击 源码\install_autostart.bat  = 注册（登录 15 秒后自动拉起）
-  双击 源码\remove_autostart.bat   = 取消
+【开机自启（推荐直接在托盘菜单里勾选）】
+  右键托盘图标 → 勾选/取消「开机自启」即可（打勾 = 已开启）
+  程序搬家后不用管, 启动时会自动修正自启路径
+  也可以用脚本: 双击 源码\install_autostart.bat 注册 /
+  源码\remove_autostart.bat 取消（登录 15 秒后自动拉起）
 
 【启动后在哪看】
   托盘风扇图标颜色即状态:

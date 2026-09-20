@@ -16,6 +16,8 @@ import ctypes
 import json
 import logging
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -31,6 +33,14 @@ else:
 LOG_PATH   = os.path.join(APP_DIR, "fan_control.log")
 CONF_PATH  = os.path.join(APP_DIR, "config.json")
 DLL_PATH   = r"C:\Program Files\PawnIO\PawnIOLib.dll"
+
+# ---- 开机自启 (计划任务) -------------------------------------------------
+TASK_NAME = "FanControl-AutoStart"
+if getattr(sys, "frozen", False):
+    EXE_FOR_TASK = os.path.abspath(sys.executable)
+else:
+    _exe = os.path.join(APP_DIR, "FanControl.exe")
+    EXE_FOR_TASK = _exe if os.path.isfile(_exe) else None
 
 # ---- EC 寄存器 (与本机实测一致) ------------------------------------------
 CTRL_PORT, DATA_PORT = 0x66, 0x62
@@ -481,6 +491,16 @@ def run_tray(ctrl):
         ctrl.request_stop("keep")
         icon.stop()
 
+    def act_autostart(icon, item):
+        on = autostart_enabled()
+        ok, _ = autostart_set(not on)
+        ctrl.say("开机自启 -> %s%s" % ("开启" if not on else "关闭",
+                  "" if ok else " (失败, 需要管理员权限)"))
+        try:
+            icon.update_menu()
+        except Exception:
+            pass
+
     def checked(mode):
         return lambda item: ctrl.mode == mode
 
@@ -497,6 +517,9 @@ def run_tray(ctrl):
                          radio=True, checked=checked("manual")),
         pystray.MenuItem("最强散热", act_max, radio=True, checked=checked("max")),
         pystray.MenuItem("EC 自动 (备用)", act_auto, radio=True, checked=checked("auto")),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("开机自启", act_autostart,
+                         checked=lambda item: autostart_enabled()),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(lambda item: "状态: %s%s" % (_mode_text(ctrl),
                          "  [未生效!]" if ctrl.last_err else ""),
@@ -538,6 +561,74 @@ def tray_updater(ctrl, icon):
         except Exception:
             pass
         ctrl.stop_evt.wait(2)
+
+
+# ==========================================================================
+# 开机自启 (计划任务 FanControl-AutoStart, 登录延迟 15 秒, 最高权限)
+# ==========================================================================
+def _schtasks(args):
+    """运行 schtasks, 返回 (返回码, 输出文本). XML 输出为 UTF-16, 其余忽略即可."""
+    try:
+        p = subprocess.run(["schtasks"] + args, capture_output=True)
+        try:
+            out = p.stdout.decode("utf-16", "ignore") if b"\x00" in (p.stdout or b"")[:4] \
+                else p.stdout.decode("gbk", "ignore")
+        except Exception:
+            out = ""
+        return p.returncode, out
+    except Exception as exc:
+        return -1, str(exc)
+
+
+def autostart_task_command():
+    """返回自启任务的 Command 路径 (未去引号原样); 任务不存在返回 None."""
+    rc, out = _schtasks(["/Query", "/TN", TASK_NAME, "/XML"])
+    if rc != 0:
+        return None
+    m = re.search(r"<Command>(.*?)</Command>", out)
+    return m.group(1) if m else ""
+
+
+def autostart_enabled():
+    """自启任务存在且指向当前 exe 才算已开启."""
+    if not EXE_FOR_TASK:
+        return False
+    cmd = autostart_task_command()
+    if not cmd:
+        return False
+    try:
+        return os.path.normpath(os.path.abspath(cmd.strip().strip('"'))) \
+            == os.path.normpath(EXE_FOR_TASK)
+    except Exception:
+        return False
+
+
+def autostart_set(enable):
+    """开启/关闭开机自启. 需要管理员权限 (程序本身已提权)."""
+    if not EXE_FOR_TASK:
+        return False, "无法定位 FanControl.exe"
+    if enable:
+        rc, out = _schtasks(["/Create", "/F", "/TN", TASK_NAME,
+                             "/TR", '"%s"' % EXE_FOR_TASK,
+                             "/SC", "ONLOGON", "/DELAY", "0000:15",
+                             "/RL", "HIGHEST"])
+        return rc == 0, out
+    rc, out = _schtasks(["/Delete", "/TN", TASK_NAME, "/F"])
+    return rc == 0, out
+
+
+def autostart_autofix(ctrl):
+    """自启任务存在但指向旧路径 (如程序搬家前) 时, 启动时自动修正."""
+    if not EXE_FOR_TASK:
+        return
+    try:
+        cmd = autostart_task_command()
+        if cmd is not None and not autostart_enabled():
+            ok, _ = autostart_set(True)
+            ctrl.say("开机自启路径已修正 -> %s%s"
+                     % (EXE_FOR_TASK, "" if ok else " (修正失败)"))
+    except Exception:
+        pass
 
 
 # ==========================================================================
