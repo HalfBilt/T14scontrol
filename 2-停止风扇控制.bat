@@ -1,6 +1,10 @@
 @echo off
-chcp 65001 >nul
-echo æ­£åœ¨å…³é—­ FanControlï¼ˆåªå…³é£Žæ‰‡å·¥å…·ï¼Œä¸åŠ¨ CPU åŠŸè€—å¢™æœåŠ¡ï¼‰...
-powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe' or Name='python.exe'\" | Where-Object { $_.CommandLine -like '*fan_control.py*' } | ForEach-Object { Write-Host ('  ç»“æŸ PID ' + $_.ProcessId); Stop-Process -Id $_.ProcessId -Force }"
-echo å®Œæˆã€‚é£Žæ‰‡ä¼šåœåœ¨æœ€åŽä¸€ä¸ªæ¡£ä½ï¼ˆä¸ä¼šè‡ªåŠ¨äº¤è¿˜ ECï¼‰ã€‚
-timeout /t 3 >nul
+chcp 936 >nul
+setlocal
+title FanControl Í£Ö¹
+
+echo ÕýÔÚ¹Ø±Õ FanControl£¨Ö»¹Ø·çÉÈ¹¤¾ß£¬²»¶¯ CPU ¹¦ºÄÇ½·þÎñ£©...
+powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe' or Name='python.exe'\" | Where-Object { $_.CommandLine -like '*fan_control.py*' } | ForEach-Object { Write-Host ('  ½áÊø PID ' + $_.ProcessId); Stop-Process -Id $_.ProcessId -Force }"
+echo Íê³É¡£·çÉÈ»áÍ£ÔÚ×îºóÒ»¸öµµÎ»£¨²»»á×Ô¶¯½»»¹ EC£©¡£
+timeout /t 4 >nul
+exit /b 0

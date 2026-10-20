@@ -1,34 +1,43 @@
 @echo off
-chcp 65001 >nul
+chcp 936 >nul
+setlocal
 cd /d "%~dp0"
+title FanControl Æô¶¯
+
 echo ============================================================
-echo   FanControl - ThinkPad T14s Gen 4 é£æ‰‡æ§åˆ¶
+echo   FanControl - ThinkPad T14s Gen 4 ·çÉÈ¿ØÖÆ
 echo ============================================================
 echo.
 
-if not exist "C:\Program Files\PawnIO\PawnIOLib.dll" (
-  echo [X] æ²¡è£… PawnIO é©±åŠ¨ â€”â€” é£æ‰‡å·¥å…·è·‘ä¸èµ·æ¥ã€‚
-  echo.
-  echo     è¯·å…ˆå®‰è£…: https://pawnio.eu/   ^(ä¸‹è½½å®‰è£…åŒ…, è£…å®Œå¯èƒ½è¦é‡å¯^)
-  echo     è£…å¥½å PawnIOLib.dll åº”è¯¥åœ¨ C:\Program Files\PawnIO\ ä¸‹ã€‚
-  echo.
-  pause
-  exit /b 1
-)
+if not exist "C:\Program Files\PawnIO\PawnIOLib.dll" goto no_pawnio
+if not exist "%~dp0runtime\pythonw.exe" goto no_runtime
 
 fltmc >nul 2>&1
 if %errorlevel%==0 goto run
-echo æ­£åœ¨è¯·æ±‚ç®¡ç†å‘˜æƒé™...
+
+echo ÕıÔÚÇëÇó¹ÜÀíÔ±È¨ÏŞ ...
 powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
-exit /b
+exit /b 0
 
 :run
-if not exist "%~dp0runtime\pythonw.exe" (
-  echo [X] ç¼ºå°‘ runtime ç›®å½•ï¼ˆæ†ç»‘çš„ Pythonï¼‰ã€‚
-  pause
-  exit /b 1
-)
 start "" "%~dp0runtime\pythonw.exe" "%~dp0src\fan_control.py"
-echo å·²å¯åŠ¨ï¼Œæ‰˜ç›˜é‡Œä¼šå¤šä¸€ä¸ªé£æ‰‡å›¾æ ‡ï¼ˆç»¿=æ™ºèƒ½ / æ©™=æ‰‹åŠ¨ / çº¢=æœ€å¼ºæ•£çƒ­ / è“=ECè‡ªåŠ¨ï¼‰ã€‚
-echo å³é”®å›¾æ ‡å¯åˆ‡æ¨¡å¼ã€å¼€/å…³å¼€æœºè‡ªå¯ã€é€€å‡ºã€‚
-timeout /t 3 >nul
+echo ÒÑÆô¶¯£¬ÍĞÅÌÀï»á¶àÒ»¸ö·çÉÈÍ¼±ê¡£
+echo   ÂÌ=ÖÇÄÜ / ³È=ÊÖ¶¯ / ºì=×îÇ¿É¢ÈÈ / À¶=EC×Ô¶¯ / »Ò=Í¨ĞÅÊ§°Ü
+echo ÓÒ¼üÍ¼±ê¿ÉÇĞÄ£Ê½¡¢¿ª/¹Ø¿ª»ú×ÔÆô¡¢ÍË³ö¡£
+timeout /t 4 >nul
+exit /b 0
+
+:no_pawnio
+echo [X] Ã»×° PawnIO Çı¶¯£¬·çÉÈ¹¤¾ßÅÜ²»ÆğÀ´¡£
+echo.
+echo     ÇëÏÈ°²×°£ºhttps://pawnio.eu/
+echo     ×°Íê¿ÉÄÜĞèÒªÖØÆô¡£
+echo     ×°ºÃºó PawnIOLib.dll Ó¦¸ÃÔÚ C:\Program Files\PawnIO\ ÏÂ¡£
+echo.
+pause
+exit /b 1
+
+:no_runtime
+echo [X] È±ÉÙ runtime Ä¿Â¼£¨À¦°óµÄ Python£©¡£
+pause
+exit /b 1
