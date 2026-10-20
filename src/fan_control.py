@@ -109,6 +109,9 @@ DEFAULT_CONFIG = {
     "load_release_s": 10.0,     #   持续该秒数才解除前馈
     # ---- 降档保护 ----
     "dwell_s": 25,           # 换档后 N 秒内不降档(防边界横跳); 0=不限制
+    # 满速档的退出温度(进 84 / 退 78): 28W 满载时 7 档压不住, 不设这个值就会
+    # 每 25 秒"满速<->7 档"锯齿一次(见 decide_level 注释); 0=关闭, 退化成普通滞回
+    "max_exit_c": 78.0,
     "mode": "smart",         # smart(智能) | manual(手动) | max(最强散热) | auto(EC自动,备用)
     "manual_level": 6,       # 手动模式档位 (0-7, 64=满速)
     # 曲线刻度 = 上面的"曲线输入温度"(EC 与 DTS 校准到同一刻度)
@@ -389,6 +392,13 @@ class LoadFeedforward(object):
         self._start = None
         self._cool = None
 
+    def reset(self):
+        """清空计时. 休眠/唤醒后必须清 —— 几个小时的睡眠会让
+        `now - _start` 变成一个巨大的数, 一醒来就误判成"负载持续很久"."""
+        self.active = False
+        self._start = None
+        self._cool = None
+
     def update(self, load, now, pct, hold_s, rel_pct, rel_s):
         if load is None:                 # 读不到就保持现状, 别乱切
             return self.active
@@ -439,17 +449,28 @@ def blend_temp(ec, dts, lead):
     return max(ec, dts - lead)
 
 
-def decide_level(temp, curve, current, hysteresis):
+def decide_level(temp, curve, current, hysteresis, max_exit=None):
     """curve: [[temp, hfsp], ...] 按温度升序. 返回目标 HFSP 值.
-    升档立即; 降档需温度低于当前档触发点 - hysteresis (防抖动)."""
+    升档立即; 降档需温度低于当前档触发点 - hysteresis (防抖动).
+
+    max_exit: 曲线最高档(本机=满速 0x40)的**退出**温度, None = 与其他档一样用滞回.
+      2026-10-20 实测出来的锯齿: 28W 满载时 7 档(3858) 压不住, DTS 一路爬到 92~95
+      -> 拉满 -> 降到 85 -> 驻留期满退回 7 档 -> 再爬上来, 每 25~26 秒一轮
+      (11:41:49 满 / 11:42:15 七档 / 11:42:45 满 / 11:43:11 七档 ...)。
+      满速档 0x40 光爬速就要 20~25 秒, 退回 7 档等于白爬。
+      把满速的退出温度单独画低(默认 78°C = 进 84 退 78), 28W 稳态就一直待在满速
+      (同负载实测: 满速 -> 核心稳在 80°C; 7 档 -> 爬到 95°C), 锯齿消失。
+    """
     if not curve:
         return current
     target = curve[0][1]
     for t, lv in curve:
         if temp >= t:
             target = lv
-    if target > current or target == current:
+    if target >= current:
         return target
+    if max_exit is not None and current == curve[-1][1]:
+        return current if temp >= max_exit else target
     # 降档: 找到当前档位对应的温度点
     tcur = None
     for t, lv in curve:
@@ -458,6 +479,19 @@ def decide_level(temp, curve, current, hysteresis):
     if tcur is not None and temp >= tcur - hysteresis:
         return current
     return target
+
+
+def wake_gap(prev, now, tick):
+    """循环空档是否大到可以判定"中间睡过"。
+
+    内核进入 S3/S4 时本线程也跟着停摆, 醒来后 `now - prev` 会跳一大截。
+    本机固件 OWAK() 会把 HFSP 抢成 0x07/0x80, 必须立刻核对重写,
+    否则要等 30 秒的转速轮询才纠正(实测 11:47:42 唤醒 -> 11:48:06 才纠正,
+    那 24 秒里风扇停在 0x80 自动档, 核心正冲到 91°C)。
+    """
+    if not prev:
+        return False
+    return (now - prev) > max(6.0, float(tick) * 3)
 
 
 # ==========================================================================
@@ -500,6 +534,7 @@ class FanController(object):
         self._ec_bad = 0
         self._rpm = None
         self._rpm_tick = 0
+        self._last_tick = 0.0           # 上一轮决策的时间戳(用于识别睡眠空档)
 
     # ---- config ----------------------------------------------------------
     def _load_config(self):
@@ -648,6 +683,7 @@ class FanController(object):
         rel_pct = float(self.cfg.get("load_release_pct", 55.0))
         rel_s = float(self.cfg.get("load_release_s", 10.0))
         dwell = float(self.cfg.get("dwell_s", 25) or 0)
+        max_exit = float(self.cfg.get("max_exit_c", 78.0) or 0)
         curve = [[int(t), int(v)] for t, v in self.cfg.get("curve", DEFAULT_CONFIG["curve"])]
         curve.sort(key=lambda x: x[0])
         self.say("启动模式: %s   曲线: %s" % (self.mode, curve))
@@ -657,10 +693,23 @@ class FanController(object):
             (">=%g°C 拉满" % dts_max) if (dts_max > 0 and self.msr) else "关闭",
             (">=%gW 持续 %gs 拉满" % (pkg_on, pkg_on_s)) if (pkg_on and self.msr) else "关闭",
             ("占用>=%g%% 持续 %gs 拉满" % (boost_pct, boost_s)) if boost_lv else "关闭"))
+        self.say("降档: 驻留 %gs | 满速档退到 %s"
+                 % (dwell, ("%g°C 才退" % max_exit) if max_exit > 0 else "普通滞回"))
 
         err_count = 0
         while not self.stop_evt.is_set():
             now = time.time()
+            # ★休眠/唤醒检测: 内核挂起时本线程也停摆, 醒来 now 会跳一大截。
+            #   立刻重读 EC 温度 + 核对 HFSP, 不等 30 秒轮询(见 wake_gap 注释)。
+            if wake_gap(self._last_tick, now, tick):
+                self.say("检测到休眠/唤醒 (循环空档 %.0f 秒), 立即重读温度并核对档位"
+                         % (now - self._last_tick))
+                self._ec_t = 0.0
+                self._rpm_tick = 0
+                self._rpm = None
+                self.ff.reset()
+                self.ff_pkg.reset()
+            self._last_tick = now
             try:
                 temp, rpm = self._ec_poll(now)
                 err_count = 0
@@ -712,7 +761,7 @@ class FanController(object):
                     cur = self.current_hfsp
                     if cur is None:
                         cur = self._read_hfsp()
-                    target = decide_level(t_ctrl, curve, cur, hyst)
+                    target = decide_level(t_ctrl, curve, cur, hyst, max_exit or None)
                     reason = ""
                     # 优先级: EC 失效保护 > DTS 锁存 > 固件热状态位 > 功耗 > 负载
                     if temp is not None and temp >= fs_temp:
@@ -1109,6 +1158,11 @@ def selftest():
     check("84C -> 满速", decide_level(84, curve, 7, 3), 64)
     check("滞回: 81C 仍满速", decide_level(81, curve, 64, 3), 64)
     check("滞回: 80C 退到 7 档", decide_level(80, curve, 64, 3), 7)
+    check("满速退出: 79C 仍满速(退 78)", decide_level(79, curve, 64, 3, 78.0), 64)
+    check("满速退出: 78C 踩线仍满速", decide_level(78, curve, 64, 3, 78.0), 64)
+    check("满速退出: 77C 才退", decide_level(77, curve, 64, 3, 78.0), 6)
+    check("满速退出: 关掉就按普通滞回(80C 退)", decide_level(80, curve, 64, 3, None), 7)
+    check("非满速档不受 max_exit 影响", decide_level(77, curve, 7, 3, 78.0), 7)
 
     print("== 2. 负载前馈状态机 (示例参数 70% / 10s 进, 55% / 10s 出) ==")
     ff = LoadFeedforward()
@@ -1127,6 +1181,8 @@ def selftest():
     ff3 = LoadFeedforward()
     ff3.update(70, 0, 70, 10, 55, 10)
     check("边界 70% 满 10 秒", ff3.update(70, 10, 70, 10, 55, 10), True)
+    ff3.reset()
+    check("reset 后回到未激活", ff3.active, False)
 
     print("== 3. DTS 换算 (TjMax - 余量) ==")
     def dts_temp(tjmax, raw):
@@ -1152,6 +1208,13 @@ def selftest():
     check("越界 132°C 丢弃", ec_temp_ok(132), False)
     check("255 丢弃", ec_temp_ok(255), False)
     check("None 丢弃", ec_temp_ok(None), False)
+
+    print("== 6. 休眠/唤醒空档识别 (tick=2 -> 阈值 6s) ==")
+    check("首次(prev=0) 不算唤醒", wake_gap(0.0, 1000.0, 2), False)
+    check("正常 2s 节拍", wake_gap(1000.0, 1002.0, 2), False)
+    check("偶发卡 6s 不误判", wake_gap(1000.0, 1006.0, 2), False)
+    check("睡了 60s -> 判定唤醒", wake_gap(1000.0, 1060.0, 2), True)
+    check("tick 放大阈值跟着放大", wake_gap(1000.0, 1010.0, 5), False)
 
     print("")
     if fails:
