@@ -165,10 +165,13 @@ class PawnIO(object):
 
         self.mutex = (ctypes.windll.kernel32.CreateMutexW(None, False, u"Global\\Access_EC")
                       if label == "LpcACPIEC" else None)
+        self.busy_skips = 0
 
     def _lock(self):
-        if self.mutex:
-            ctypes.windll.kernel32.WaitForSingleObject(self.mutex, 2000)
+        if not self.mutex:
+            return True
+        rc = ctypes.windll.kernel32.WaitForSingleObject(self.mutex, 2000)
+        return rc in (0x00000000, 0x00000080)      # WAIT_OBJECT_0 / WAIT_ABANDONED
 
     def _unlock(self):
         if self.mutex:
@@ -212,12 +215,39 @@ class PawnIO(object):
             self.pio_read(DATA_PORT)
             time.sleep(0.001)
 
+    def _ensure_idle(self, what):
+        """总线空闲才动手; 别人正在等数据就放弃这一轮。
+
+        ★2026-10-20(12:31:49 凉机强制休眠): 系统日志 12:31:47 报 ACPI 事件 13
+          "EC 未响应", 2 秒后 12:31:49 报 Kernel-Power 88 —— 当时 EC 只有 58°C、
+          18W, 根本不是热。链条是:
+              我们的端口事务(或 HWiNFO)把系统 ACPI EC 驱动正在等的 OBF 数据读走
+              -> 那边超时 -> DSDT 的 _TMP 拿到失败/垃圾值 -> 固件报 _HOT -> 休眠
+          所以这里改成"看到 OBF 挂着就不碰": 宁可这一轮温度沿用上次的值,
+          也不再抢别人的字节。连续 5 次都挂着才认作我们自己上次留下的残余并清掉。
+        """
+        st = self.pio_read(CTRL_PORT)
+        if st & (FLAG_IBF | FLAG_OBF):
+            self.busy_skips += 1
+            if self.busy_skips < 5:
+                return False
+            self._drain()                       # 只可能是我们自己留下的
+            self.busy_skips = 0
+        else:
+            self.busy_skips = 0
+        if not self._wait(0, FLAG_IBF | FLAG_OBF, timeout_ms=50):
+            return False
+        # 再确认一次: 刚看到空闲, 对方可能正好在这 1~2 ms 里开始写
+        time.sleep(0.002)
+        st = self.pio_read(CTRL_PORT)
+        return not (st & (FLAG_IBF | FLAG_OBF))
+
     def ec_read(self, offset):
-        self._lock()
+        if not self._lock():
+            raise RuntimeError("EC 互斥锁超时(被 HWiNFO 等占用), 跳过读 0x%02X" % offset)
         try:
-            self._drain()
-            if not self._wait(0, FLAG_IBF | FLAG_OBF):
-                raise RuntimeError("EC 状态超时 (读 0x%02X)" % offset)
+            if not self._ensure_idle("读 0x%02X" % offset):
+                raise RuntimeError("EC 忙(他人占用), 跳过读 0x%02X" % offset)
             self.pio_write(CTRL_PORT, CMD_READ)
             if not self._wait(0, FLAG_IBF):
                 raise RuntimeError("EC IBF 超时 (读 0x%02X)" % offset)
@@ -229,11 +259,11 @@ class PawnIO(object):
             self._unlock()
 
     def ec_write(self, offset, value):
-        self._lock()
+        if not self._lock():
+            raise RuntimeError("EC 互斥锁超时(被 HWiNFO 等占用), 跳过写 0x%02X" % offset)
         try:
-            self._drain()
-            if not self._wait(0, FLAG_IBF | FLAG_OBF):
-                raise RuntimeError("EC 状态超时 (写 0x%02X)" % offset)
+            if not self._ensure_idle("写 0x%02X" % offset):
+                raise RuntimeError("EC 忙(他人占用), 跳过写 0x%02X" % offset)
             self.pio_write(CTRL_PORT, CMD_WRITE)
             if not self._wait(0, FLAG_IBF):
                 raise RuntimeError("EC IBF 超时 (写 0x%02X)" % offset)
@@ -533,7 +563,8 @@ class FanController(object):
         self._ec_t = 0.0
         self._ec_bad = 0
         self._rpm = None
-        self._rpm_tick = 0
+        self._rpm_t = 0.0               # 上次读转速的时间戳
+        self._rpm_fast_until = 0.0      # 换档后的一段时间内把转速采样提速(见 _ec_poll)
         self._last_tick = 0.0           # 上一轮决策的时间戳(用于识别睡眠空档)
 
     # ---- config ----------------------------------------------------------
@@ -641,13 +672,19 @@ class FanController(object):
                              % (raw, self._ec_bad))
             self._ec_t = now
 
-            # 转速 + HFSP 核对: 每 6 次 EC 读(约 30 秒)一次
+            # 转速 + HFSP 核对
             #   本机固件 OWAK() 里有 If(SCRM) HFSP=0x07, 唤醒后会抢回档位,
             #   不核对的话工具会一直以为还是原来那档, 再也不重写。
-            self._rpm_tick += 1
-            if self._rpm_tick % 6 == 1 or self._rpm is None:
+            #
+            # ★2026-10-20(托盘对不上): 原来固定"每 6 次 EC 读"(约 30 秒)读一次转速,
+            #   而 0x40 从写下去到爬稳要 20~25 秒 —— 托盘上那 30 秒显示的是**换档前**的转速,
+            #   看着就像"点了满速没反应"。改成: 换档后 35 秒内跟着温度一起读(每 5 秒),
+            #   平时仍是 30 秒一次(不增加 EC 总线负担)。
+            interval = self._ec_cycle if now < self._rpm_fast_until else 30.0
+            if self._rpm is None or now - self._rpm_t >= interval:
                 try:
                     self._rpm = self.ec.rpm()
+                    self._rpm_t = now
                     real = self.ec.ec_read(EC_FAN)
                     if (real is not None and self.current_hfsp is not None
                             and real != self.current_hfsp):
@@ -705,7 +742,7 @@ class FanController(object):
                 self.say("检测到休眠/唤醒 (循环空档 %.0f 秒), 立即重读温度并核对档位"
                          % (now - self._last_tick))
                 self._ec_t = 0.0
-                self._rpm_tick = 0
+                self._rpm_t = 0.0
                 self._rpm = None
                 self.ff.reset()
                 self.ff_pkg.reset()
@@ -778,9 +815,7 @@ class FanController(object):
                           and dwell > 0 and (now - self._last_change) < dwell):
                         target = self.current_hfsp      # 驻留期内不降档
                     if target != self.current_hfsp:
-                        self.ec.set_fan(target)
-                        self.current_hfsp = target
-                        self._last_change = now
+                        self._write_level(target, now)
                         self._last_reason = reason
                         self.say("%s  EC=%s DTS=%s PKG=%s  RPM=%s  -> 0x%02X (%s RPM)%s"
                                  % (time.strftime("%H:%M:%S"),
@@ -801,18 +836,14 @@ class FanController(object):
                                  % (temp if temp is not None else "--",
                                     dts if dts is not None else "--"))
                     if target != self.current_hfsp:
-                        self.ec.set_fan(target)
-                        self.current_hfsp = target
-                        self._last_change = now
+                        self._write_level(target, now)
                         self.say("%s  手动模式: 档位 %s (0x%02X, %s RPM)"
                                  % (time.strftime("%H:%M:%S"),
                                     "满速" if manual == 64 else manual,
                                     target, LEVEL_RPM.get(target, "?")))
                 elif mode == "max":
                     if self.current_hfsp != 64:
-                        self.ec.set_fan(64)
-                        self.current_hfsp = 64
-                        self._last_change = now
+                        self._write_level(64, now)
                         self.say("%s  最强散热: 满速 0x40 (%s RPM)"
                                  % (time.strftime("%H:%M:%S"),
                                     LEVEL_RPM.get(64, "?")))
@@ -836,6 +867,17 @@ class FanController(object):
                 pass
             if self.msr is not None:
                 self.msr.close()
+
+    def _write_level(self, level, now):
+        """写档位 + 记录时间 + 打开"转速快采样"窗口。
+
+        0x40 从写下去到爬稳要 20~25 秒, 托盘上要看得见这个过程(否则像"没执行");
+        窗口内的转速/档位核对改成每个 EC 周期(5 秒)读一次, 窗口外仍 30 秒一次。
+        """
+        self.ec.set_fan(level)
+        self.current_hfsp = level
+        self._last_change = now
+        self._rpm_fast_until = now + 35.0
 
     def _read_hfsp(self):
         try:
@@ -983,25 +1025,45 @@ def _mode_text(ctrl):
 
 
 def tray_updater(ctrl, icon):
-    """控制线程里定期刷新托盘 tooltip 和图标"""
+    """控制线程里定期刷新托盘 tooltip 和图标。
+
+    ★2026-10-20: 原来只显示 EC 温度(0x78, 比核心滞后 5~15°C)和 30 秒才更新一次的转速,
+      用户看到的"详细情况"和 HWiNFO 对不上。现在:
+        · EC 温度 / 核心温度(DTS) 并排显示 —— 前者是曲线输入, 后者才是机身真实热区;
+        · 转速在换档后 35 秒内每 5 秒刷新(见 _ec_poll), 并标出"(爬速中)";
+        · 附带当前档位名(满速/7档/…), 一眼能看出 0x2F 现在是什么。
+    """
     while not ctrl.stop_evt.is_set():
         try:
             temp, rpm = ctrl.last_temp, ctrl.last_rpm
             warn = "  ⚠未生效" if ctrl.last_err else ""
-            extra = ""
+            lv = ctrl.current_hfsp
+            lv_txt = ""
+            if lv is not None:
+                if lv == 64:
+                    lv_txt = "满速"
+                elif lv == 0x80:
+                    lv_txt = "EC自动"
+                elif lv == 0:
+                    lv_txt = "停转"
+                elif lv in LEVEL_RPM:
+                    lv_txt = "%d档" % lv
+            bits = [("EC %d°C" % temp) if temp is not None else "EC --"]
             if ctrl.last_dts is not None:
-                extra += "  DTS %d°C" % ctrl.last_dts
+                bits.append("核心 %d°C" % ctrl.last_dts)
             if ctrl.last_pkg is not None:
-                extra += "  %.0fW" % ctrl.last_pkg
+                bits.append("%.0fW" % ctrl.last_pkg)
             if ctrl.last_load is not None:
-                extra += "  负载 %.0f%%" % ctrl.last_load
+                bits.append("负载 %.0f%%" % ctrl.last_load)
             if ctrl.ff_active or ctrl.pkg_active:
-                extra += " [前馈]"
-            icon.title = "FanControl %s%s  CPU %s%s  %s RPM" % (
-                _mode_text(ctrl), warn,
-                ("%d°C" % temp) if temp is not None else "--",
-                extra,
-                rpm if rpm is not None else "--")
+                bits.append("[前馈]")
+            rp = ("%d RPM" % rpm) if rpm is not None else "-- RPM"
+            if lv_txt:
+                rp += " " + lv_txt
+            if lv == 64 and time.time() < getattr(ctrl, "_rpm_fast_until", 0.0):
+                rp += "(爬速中)"
+            icon.title = "FanControl %s%s  |  %s  |  %s" % (
+                _mode_text(ctrl), warn, " ".join(bits), rp)
             icon.icon = make_icon_image(ctrl)
         except Exception:
             pass
