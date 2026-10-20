@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 FanControl -- ThinkPad T14s Gen 4 智能风扇控制
@@ -778,6 +778,29 @@ class FanController(object):
         self.say("服务模式: 以 SYSTEM 身份接管风扇(不依赖用户登录)")
         self._control_loop(stop_evt, wake_evt, resume, pbt_name)
 
+    def _pub_status(self, temp, dts, pkg, rpm):
+        """给任务栏 HUD 用的状态快照（原子写，失败不影响控制）。"""
+        try:
+            import json as _json
+            d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '..', 'status')
+            os.makedirs(d, exist_ok=True)
+            obj = {
+                'ts': round(time.time(), 2),
+                'hfsp': self.current_hfsp,
+                'rpm': rpm,
+                'ec': temp,
+                'dts': dts,
+                'pkg': round(pkg, 1) if pkg is not None else None,
+                'load': self.last_load,
+                'mode': self.mode,
+            }
+            tmp = os.path.join(d, 'fan.json.tmp')
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                _json.dump(obj, fh, ensure_ascii=False)
+            os.replace(tmp, os.path.join(d, 'fan.json'))
+        except Exception:
+            pass
+
     def _control_loop(self, stop_evt, wake_evt, resume, pbt_name):
         """主控制循环。stop_evt/wake_evt 为 None 表示托盘模式(用 self.stop_evt)。"""
         cycle = max(1, int(self.cfg.get("cycle_sec", 5)))
@@ -910,6 +933,7 @@ class FanController(object):
                 self.last_pkg = pkg
                 self.ff_active, self.pkg_active = ff, ff_pkg
                 mode = self.mode
+            self._pub_status(temp, dts, pkg, rpm)
 
             try:
                 if mode == "smart":
