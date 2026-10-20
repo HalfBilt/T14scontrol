@@ -13,3 +13,4 @@ dist/
 
 # 捆绑的 Python 运行时（46MB，不进仓库；由部署时复制）
 runtime/
+fan_service.log
