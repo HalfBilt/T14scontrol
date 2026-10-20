@@ -225,6 +225,7 @@ def _proto():
     user32.TrackPopupMenu.restype = ctypes.c_int
     user32.SetWindowPos.argtypes = [w.HWND, w.HWND, ctypes.c_int, ctypes.c_int,
                                     ctypes.c_int, ctypes.c_int, w.UINT]
+    user32.DestroyIcon.argtypes = [w.HICON]
     user32.CreateIconIndirect.argtypes = [P(ICONINFO)]
     user32.CreateIconIndirect.restype = w.HICON
     user32.GetCursorPos.argtypes = [P(w.POINT)]
@@ -235,6 +236,7 @@ def _proto():
     user32.DispatchMessageW.argtypes = [P(w.MSG)]
     user32.DispatchMessageW.restype = LRESULT
     user32.DrawTextW.argtypes = [w.HDC, w.LPCWSTR, ctypes.c_int, P(w.RECT), w.UINT]
+    user32.FillRect.argtypes = [w.HDC, P(w.RECT), w.HBRUSH]
     user32.TrackMouseEvent.argtypes = [P(TRACKMOUSEEVENT)]
 
     gdi32.CreateFontW.argtypes = [ctypes.c_int] * 13 + [w.LPCWSTR]
@@ -325,7 +327,7 @@ def bgr(rgb):
     return rgb[0] | (rgb[1] << 8) | (rgb[2] << 16)
 
 
-def _fresh(d, secs=10.0):
+def _fresh(d, secs=15.0):
     return bool(d) and (time.time() - float(d.get('ts') or 0)) < secs
 
 
@@ -454,7 +456,7 @@ class Hud(object):
         if self.font:
             gdi32.DeleteObject(self.font)
         self.font_px = fh
-        self.font = gdi32.CreateFontW(-fh, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 5, 0,
+        self.font = gdi32.CreateFontW(-fh, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 4, 0,
                                       'Segoe UI Variable Text')
 
     # ---- 双缓冲 DIB
@@ -539,6 +541,7 @@ class Hud(object):
         x, y = r.left, r.top
         if self.auto_pos:
             x = rc.right - int(self.cfg.get('offset_right') or 470) - wid
+            x = max(rc.left + 6, min(x, rc.right - wid - 6))
             y = rc.top + (tb_h - hei) // 2
         if (r.right - r.left) != wid or (r.bottom - r.top) != hei:
             user32.SetWindowPos(self.hwnd, HWND_TOPMOST, x, y, wid, hei, SWP_NOACTIVATE)
@@ -699,24 +702,25 @@ class Hud(object):
             rect = w.RECT(0, 0, size, size)
 
             user32.FillRect(mem, ctypes.byref(rect), black)
-            gdi32.SelectObject(mem, disc)
-            gdi32.Ellipse(mem, 0, 0, size, size)
 
-            gdi32.SelectObject(mem, blade)
+            gdi32.SelectObject(mem, disc)      # 扇叶用温度色，底透明
             for i in range(3):
-                a1 = math.radians(i * 120 + 18)
-                a2 = math.radians(i * 120 + 102)
+                # Pie 在屏幕坐标里按逆时针取弧: 想画 a1->a2 的 84 度，必须把 a2 当起点传
+                a1 = math.radians(i * 120 + 24)
+                a2 = math.radians(i * 120 + 86)
                 gdi32.Pie(mem, 0, 0, size, size,
-                          int(round(c + c * math.cos(a1))), int(round(c + c * math.sin(a1))),
-                          int(round(c + c * math.cos(a2))), int(round(c + c * math.sin(a2))))
+                          int(round(c + c * math.cos(a2))), int(round(c + c * math.sin(a2))),
+                          int(round(c + c * math.cos(a1))), int(round(c + c * math.sin(a1))))
 
             gdi32.SelectObject(mem, hub)
             gdi32.Ellipse(mem, c - 6, c - 6, c + 6, c + 6)
 
-            # GDI 画完 alpha 全 0，32bpp 图标会被当全透明 -> 手动置 255
+            # GDI 画完 alpha 全 0：32bpp 图标的 alpha 会被尊重，必须自己写。
+            # 只给圆内像素 alpha=255，圆外=0（否则 mask 被忽略，整个方块都是黑的）
             buf = (ctypes.c_ubyte * (size * size * 4)).from_address(bits.value)
-            for i in range(3, size * size * 4, 4):
-                buf[i] = 255
+            # 透明底：alpha 直接取亮度（黑底上画的彩色/白色图形，边缘自带抗锯齿）
+            for i in range(0, size * size * 4, 4):
+                buf[i + 3] = max(buf[i], buf[i + 1], buf[i + 2])
 
             mmem = gdi32.CreateCompatibleDC(hdc)
             gdi32.SelectObject(mmem, mask)
@@ -748,8 +752,11 @@ class Hud(object):
             self.icon_col = col
             new = self.make_fan_icon(col)
             if new:
+                old = self.icon
                 self.icon = new
                 self.nid.hIcon = new
+                if old:
+                    user32.DestroyIcon(old)
         txt = ' '.join(t for t, _r in self.segs)
         self.nid.szTip = ('%s  %s' % (APP_NAME, txt))[:120]
         shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self.nid))
@@ -851,7 +858,8 @@ class Hud(object):
             if msg == WM_PAINT:
                 return 0                     # 全部走 UpdateLayeredWindow
             if msg == WM_TIMER:
-                self.refresh()
+                if self.visible:
+                    self.refresh()
                 self.tray_tip()
                 return 0
             if msg == WM_TRAY:
