@@ -1,15 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FanControl -- ThinkPad T14s Gen 4 智能风扇控制 (PawnIO EC 直连)
+FanControl -- ThinkPad T14s Gen 4 智能风扇控制 (PawnIO 双模块)
 重写自 TPFanCtrl2 fork 的核心功能, 修复其两个缺陷:
   1) 启动时按配置文件恢复模式 (Smart/手动), 不再每次都回到 EC 自动
   2) 界面语言/模式等任何变更立即持久化到 config.json
 
+★2026-10-20 拆分后补回全部能力 (不依赖 TSCtl / ThrottleStop 驱动):
+  - 双 PawnIO 模块: LpcACPIEC(读写 EC 0x2F 等) + IntelMSR(只读 MSR)
+    ★一个句柄只能加载一个模块 —— 驱动把 blob 绑在文件对象上,
+      FsContext 已有值就返回 STATUS_ALREADY_INITIALIZED。
+      所以两个模块各开一个 PawnIO 实例(两个句柄)。
+  - DTS 快速通道: MSR 0x1B1 / 0x1A2 算出的封装温度比 EC 0x78 快 5~10 秒,
+    >= dts_max_c(92°C) 立即拉满 0x40, 不等 EC 温度爬上来。
+    MSR 不占 EC 总线, 每轮都读也不会和 CPU 功耗墙工具抢 0x62/0x66。
+  - 负载前馈: GetSystemTimes(纯 Win32 API, 免驱动), 系统占用 >= 70%
+    持续 10 秒就提前拉满; 回落到 55% 以下持续 10 秒才解除。
+  - 新曲线: 最低档用 0x01(不停转), 84°C 前插一档 7 档。
+
 用法:
   pythonw fan_control.py            常规启动 (托盘图标)
   python  fan_control.py --console  带控制台日志启动
-  python  fan_control.py --selftest 只测曲线决策逻辑, 不碰 EC
+  python  fan_control.py --selftest 只测曲线/前馈/温度换算逻辑, 不碰 EC
 """
 
 import ctypes
@@ -27,11 +39,13 @@ if getattr(sys, "frozen", False):
     # PyInstaller 打包后: 配置/日志放 exe 旁边, 资源从解包目录取
     APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
     BLOB_PATH = os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "LpcACPIEC.bin")
+    BLOB_MSR  = os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "IntelMSR.bin")
 else:
     # 源码运行: src/ 的上一级 = T14scontrol\fan, 配置/日志放那里,
     # 这样和 exe 版行为一致(重装/换 src 都不会丢配置)
     APP_DIR = os.path.dirname(SCRIPT_DIR)
     BLOB_PATH = os.path.join(SCRIPT_DIR, "LpcACPIEC.bin")
+    BLOB_MSR  = os.path.join(SCRIPT_DIR, "IntelMSR.bin")
 LOG_PATH   = os.path.join(APP_DIR, "fan_control.log")
 CONF_PATH  = os.path.join(APP_DIR, "config.json")
 DLL_PATH   = r"C:\Program Files\PawnIO\PawnIOLib.dll"
@@ -56,6 +70,11 @@ EC_CPU_TMP = 0x78
 # ★0x31(HUWB/VPON/VRST) **不要写** —— 老 IBM/X60 那代才是 fan select。
 #   本机实测写 0 和不写, 读到的转速一模一样, 但 VPON/VRST 位会被清掉。
 
+# ---- MSR (官方 IntelMSR 模块的读白名单里都有, 只能读不能写这些) ----------
+MSR_TJMAX        = 0x1A2   # IA32_TEMPERATURE_TARGET, bits 23:16 = TjMax
+MSR_THERM_STATUS = 0x1B1   # IA32_PACKAGE_THERM_STATUS, bits 22:16 = 距 TjMax 的余量
+MSR_PERF_STATUS  = 0x198   # IA32_PERF_STATUS, bits 15:8 = 当前倍频(x100MHz)
+
 # ★2026-10-20 本机全档位实测标定(手册 scripts/风扇档位-20261020-075530.txt):
 #   0x01=2471  0x02=2858  0x03=3181  0x04=3186  0x05=3167
 #   0x06=3456(低温)~3861(高温)  0x07=3858(≈6档)  0x40=4807(固定, 20~25 秒到位)
@@ -67,23 +86,41 @@ LEVEL_RPM = {0: 0, 1: 2471, 2: 2858, 3: 3181, 4: 3186,
 DEFAULT_CONFIG = {
     "cycle_sec": 5,          # ★5 秒(原 2 秒): EC 是慢总线, 与 CPU 工具共用, 别太勤
     "hysteresis": 3,
-    "failsafe_temp": 88,     # CPU 达到该温度无条件拉满速 0x40
-    "mode": "smart",         # smart(智能) | manual(手动) | max(最强散热) | auto(EC自动,固件修复后用)
+    "failsafe_temp": 88,     # EC 0x78 达到该温度无条件拉满速 0x40
+    # ---- DTS 快速通道 (MSR 0x1B1, 不占 EC 总线) ----
+    "dts_max_c": 92.0,       # DTS >= 该值立即拉满 (0=关闭)
+    # ---- 负载前馈 (GetSystemTimes, 免驱动) ----
+    "load_boost_pct": 70.0,  # 占用 >= 该值
+    "load_boost_s": 10.0,    #   持续该秒数 -> 拉满
+    "load_boost_level": 64,  #   前馈目标档位 (0=关闭前馈)
+    "load_release_pct": 55.0,   # 占用回落到该值以下
+    "load_release_s": 10.0,     #   持续该秒数才解除前馈
+    # ---- 降档保护 ----
+    "dwell_s": 25,           # 换档后 N 秒内不降档(防边界横跳); 0=不限制
+    "mode": "smart",         # smart(智能) | manual(手动) | max(最强散热) | auto(EC自动,备用)
     "manual_level": 6,       # 手动模式档位 (0-7, 64=满速)
-    # 只用实测有意义的档: 0(停) -> 1 -> 2 -> 6 -> 64(满速)。3/4/5/7 已证明没有区分度。
-    "curve": [[40, 0], [45, 1], [50, 2], [62, 6], [84, 64]],
+    # 曲线刻度 = EC 0x78(所有实测数据都在这个刻度上; DTS 只走快速通道, 不进曲线)
+    #   <45°C -> 1档(2471)  : 最低档用 0x01 不用 0x00, 停转后遇突发要从零起步
+    #   55°C -> 2档(2858)
+    #   65°C -> 3档(3181)
+    #   75°C -> 6档(3456~3861, 固件随温度加力)
+    #   79°C -> 7档(3858)   : 84°C 拉满之前的缓冲档
+    #   84°C -> 满速(4807)  : 0x40 要 20~25 秒才到位, 所以阈值必须靠前
+    "curve": [[45, 1], [55, 2], [65, 3], [75, 6], [79, 7], [84, 64]],
 }
 
 
 # ==========================================================================
-# PawnIO / EC 访问层 (移植自实测通过的 ec_direct.py)
+# PawnIO 访问层 (一个实例 = 一个模块; 见文件头说明, 不能共用一个句柄)
 # ==========================================================================
 class PawnIO(object):
-    def __init__(self):
+    def __init__(self, blob_path=None, label="LpcACPIEC"):
+        blob_path = blob_path or BLOB_PATH
+        self.label = label
         if not os.path.isfile(DLL_PATH):
             raise RuntimeError("找不到 PawnIOLib.dll: %s (请确认 PawnIO 驱动已安装)" % DLL_PATH)
-        if not os.path.isfile(BLOB_PATH):
-            raise RuntimeError("找不到 LpcACPIEC.bin: %s" % BLOB_PATH)
+        if not os.path.isfile(blob_path):
+            raise RuntimeError("找不到 %s: %s" % (os.path.basename(blob_path), blob_path))
 
         self.lib = ctypes.WinDLL(DLL_PATH)
         L = self.lib
@@ -105,13 +142,14 @@ class PawnIO(object):
         if hr < 0 or not self.handle.value:
             raise RuntimeError("pawnio_open 失败 (0x%08X) —— 请以管理员身份运行" % (hr & 0xFFFFFFFF))
 
-        blob = open(BLOB_PATH, "rb").read()
+        blob = open(blob_path, "rb").read()
         hr = L.pawnio_load(self.handle, blob, len(blob))
         if hr < 0:
             self.close()
-            raise RuntimeError("pawnio_load(LpcACPIEC) 失败 (0x%08X)" % (hr & 0xFFFFFFFF))
+            raise RuntimeError("pawnio_load(%s) 失败 (0x%08X)" % (label, hr & 0xFFFFFFFF))
 
-        self.mutex = ctypes.windll.kernel32.CreateMutexW(None, False, u"Global\\Access_EC")
+        self.mutex = (ctypes.windll.kernel32.CreateMutexW(None, False, u"Global\\Access_EC")
+                      if label == "LpcACPIEC" else None)
 
     def _lock(self):
         if self.mutex:
@@ -137,6 +175,10 @@ class PawnIO(object):
 
     def pio_write(self, port, value):
         self.execute("ioctl_pio_write", [port, value & 0xFF], 0)
+
+    def read_msr(self, reg):
+        """IntelMSR 模块的 ioctl_read_msr: in=[msr], out=[value]."""
+        return int(self.execute("ioctl_read_msr", [reg & 0xFFFFFFFF], 1)[0]) & 0xFFFFFFFFFFFFFFFF
 
     def _wait(self, want_set, want_clear, timeout_ms=1000):
         deadline = time.time() + timeout_ms / 1000.0
@@ -210,6 +252,123 @@ class PawnIO(object):
 
 
 # ==========================================================================
+# DTS 快速通道 (MSR 0x1B1 + 0x1A2) —— 独立 PawnIO 实例, 不占 EC 总线
+# ==========================================================================
+class MSRThermal(object):
+    """读 CPU 封装温度 (DTS) 与实时倍频.
+
+    温度 = TjMax - (0x1B1 >> 16 & 0x7F)。0x1B1 存的是"距 TjMax 的余量",
+    直接当摄氏度读会得到 0°C 之类的荒谬值(早期脚本踩过)。
+    ★注意: 满载时这个寄存器的读数会偏保守(有时反而走低), 所以它只当
+      "提前量"用; 真正的兜底仍然是 EC 0x78 的 88°C 失效保护。
+    """
+
+    def __init__(self):
+        self.io = PawnIO(BLOB_MSR, "IntelMSR")
+        self.tjmax = self._read_tjmax()
+
+    def _read_tjmax(self):
+        try:
+            v = self.io.read_msr(MSR_TJMAX)
+            t = (v >> 16) & 0xFF
+            return t if 50 <= t <= 120 else 100
+        except Exception:
+            return 100
+
+    def read(self):
+        """返回 dict(temp, thermal_status, ratio); 失败返回 None."""
+        try:
+            v = self.io.read_msr(MSR_THERM_STATUS)
+            dts = (v >> 16) & 0x7F
+            temp = self.tjmax - dts
+            if temp < 20 or temp > 120:      # 明显是总线/寄存器抽风
+                return None
+            ratio = None
+            try:
+                ratio = (self.io.read_msr(MSR_PERF_STATUS) >> 8) & 0xFF
+            except Exception:
+                pass
+            return {"temp": temp, "thermal_status": v & 1, "ratio": ratio}
+        except Exception:
+            return None
+
+    def close(self):
+        self.io.close()
+
+
+# ==========================================================================
+# 系统 CPU 占用 (纯 Win32 API, 免驱动)
+# ==========================================================================
+class _FILETIME(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", ctypes.c_uint32),
+                ("dwHighDateTime", ctypes.c_uint32)]
+
+
+_PREV_CPU_TIMES = None
+
+
+def cpu_load_pct():
+    """全系统 CPU 占用率 0~100 (GetSystemTimes, 不需要任何驱动).
+
+    第一次调用只建基准返回 None; 之后每次算与上次的差值, 所以调用间隔
+    就是统计窗口(控制循环 5 秒一次正合适)。
+    kernel 时间包含 idle, 因此"忙" = 总增量 - idle 增量。
+    """
+    global _PREV_CPU_TIMES
+    idle, kernel, user = _FILETIME(), _FILETIME(), _FILETIME()
+    if not ctypes.windll.kernel32.GetSystemTimes(
+            ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
+        return None
+
+    def _v(f):
+        return (f.dwHighDateTime << 32) | f.dwLowDateTime
+
+    i, k, u = _v(idle), _v(kernel), _v(user)
+    prev, _PREV_CPU_TIMES = _PREV_CPU_TIMES, (i, k, u)
+    if prev is None:
+        return None
+    d_idle = i - prev[0]
+    d_all = (k - prev[1]) + (u - prev[2])
+    if d_all <= 0:
+        return None
+    return min(100.0, max(0.0, 100.0 * (d_all - d_idle) / d_all))
+
+
+class LoadFeedforward(object):
+    """占用 >= pct 持续 hold_s 秒 -> 激活; 回落到 rel_pct 以下持续
+    rel_s 秒 -> 解除。进入/退出用两套阈值(70/55), 防止在阈值上抖动。"""
+
+    def __init__(self):
+        self.active = False
+        self._start = None
+        self._cool = None
+
+    def update(self, load, now, pct, hold_s, rel_pct, rel_s):
+        if load is None:                 # 读不到就保持现状, 别乱切
+            return self.active
+        if self.active:
+            if load < rel_pct:
+                if self._cool is None:
+                    self._cool = now
+                if now - self._cool >= rel_s:
+                    self.active = False
+                    self._start = None
+                    self._cool = None
+            else:
+                self._cool = None
+            return self.active
+        if load >= pct:
+            if self._start is None:
+                self._start = now
+            if now - self._start >= hold_s:
+                self.active = True
+                self._cool = None
+        else:
+            self._start = None
+        return self.active
+
+
+# ==========================================================================
 # 曲线决策 (含滞回), 可独立自测
 # ==========================================================================
 def decide_level(temp, curve, current, hysteresis):
@@ -255,6 +414,16 @@ class FanController(object):
         self.last_temp = None
         self.last_rpm = None
         self.last_err = ""
+        # DTS / 负载前馈 状态
+        self.msr = None                 # MSRThermal 实例(可缺席)
+        self.last_dts = None            # DTS 温度 °C
+        self.last_dts_text = "--"       # 给托盘用
+        self.last_load = None           # 系统占用 %
+        self.ff = LoadFeedforward()
+        self.ff_active = False
+        self._dts_latch = False         # DTS 是否处于"已过热"锁存(带 4°C 回差)
+        self._last_change = 0.0         # 上次换档的时间戳(用于 dwell)
+        self._last_reason = ""          # 上次拉满的原因(给日志/托盘)
 
     # ---- config ----------------------------------------------------------
     def _load_config(self):
@@ -318,10 +487,20 @@ class FanController(object):
             except Exception:
                 pass
 
-    # ---- EC ----------------------------------------------------------------
+    # ---- EC / MSR -----------------------------------------------------------
     def _ec_init(self):
         self.ec = PawnIO()
         self.say("EC 通道就绪 (PawnIO, LpcACPIEC %d 字节)" % os.path.getsize(BLOB_PATH))
+        # DTS 通道: 独立句柄 + 独立模块, 打不开也不影响风扇主功能
+        try:
+            self.msr = MSRThermal()
+            t = self.msr.read()
+            self.say("DTS 通道就绪 (IntelMSR, TjMax=%d) 当前 DTS=%s"
+                     % (self.msr.tjmax,
+                        ("%d°C" % t["temp"]) if t else "读不到"))
+        except Exception as exc:
+            self.msr = None
+            self.say("DTS 通道不可用 (%s) —— 只靠 EC 温度与负载前馈" % exc)
 
     def _safe_snapshot(self):
         temp = self.ec.ec_read(EC_CPU_TMP)
@@ -355,17 +534,24 @@ class FanController(object):
         cycle = max(1, int(self.cfg.get("cycle_sec", 5)))
         hyst = int(self.cfg.get("hysteresis", 3))
         fs_temp = int(self.cfg.get("failsafe_temp", 88))
+        dts_max = float(self.cfg.get("dts_max_c", 92.0) or 0)
+        boost_pct = float(self.cfg.get("load_boost_pct", 70.0))
+        boost_s = float(self.cfg.get("load_boost_s", 10.0))
+        boost_lv = int(self.cfg.get("load_boost_level", 64) or 0)
+        rel_pct = float(self.cfg.get("load_release_pct", 55.0))
+        rel_s = float(self.cfg.get("load_release_s", 10.0))
+        dwell = float(self.cfg.get("dwell_s", 25) or 0)
         curve = [[int(t), int(v)] for t, v in self.cfg.get("curve", DEFAULT_CONFIG["curve"])]
         curve.sort(key=lambda x: x[0])
         self.say("启动模式: %s   曲线: %s" % (self.mode, curve))
+        self.say("快速通道: DTS %s | 负载 %s" % (
+            (">=%g°C 拉满" % dts_max) if (dts_max > 0 and self.msr) else "关闭",
+            ("占用>=%g%% 持续 %gs -> 拉满" % (boost_pct, boost_s)) if boost_lv else "关闭"))
 
         err_count = 0
         while not self.stop_evt.is_set():
             try:
                 temp, rpm = self._safe_snapshot()
-                with self.lock:
-                    self.last_temp, self.last_rpm = temp, rpm
-                    mode = self.mode
                 err_count = 0
                 self.last_err = ""
             except Exception as exc:
@@ -376,30 +562,70 @@ class FanController(object):
                 self.stop_evt.wait(cycle)
                 continue
 
+            # ---- 快速通道采样: DTS(MSR, 不占 EC 总线) + 系统占用 ----
+            dts = dts_status = None
+            if self.msr is not None:
+                r = self.msr.read()
+                if r:
+                    dts, dts_status = r["temp"], r["thermal_status"]
+            load = cpu_load_pct()
+            now = time.time()
+            ff = self.ff.update(load, now, boost_pct, boost_s, rel_pct, rel_s)
+            # DTS 自带 4°C 回差, 免得在阈值上 64<->7 来回切
+            if dts is not None and dts_max > 0:
+                if dts >= dts_max:
+                    self._dts_latch = True
+                elif dts <= dts_max - 4:
+                    self._dts_latch = False
+            # 固件热状态位(0x1B1 bit0)只在温度确实高时才认 —— 本机固件有"锁存位"
+            # 的先例(EC 0x89), 不设温度门的话一个卡住的位会把风扇永久钉在满速。
+            bit_hot = bool(dts_status) and dts is not None and dts_max > 0 and dts >= dts_max - 8
+            with self.lock:
+                self.last_temp, self.last_rpm = temp, rpm
+                self.last_dts, self.last_load, self.ff_active = dts, load, ff
+                mode = self.mode
+
             try:
                 if mode == "smart":
                     cur = self.current_hfsp
                     if cur is None:
                         cur = self._read_hfsp()
                     target = decide_level(temp, curve, cur, hyst)
-                    if temp >= fs_temp and target != 64:
-                        target = 64
-                        self.say("!! 失效保护: CPU %dC >= %dC, 强制满速 0x40" % (temp, fs_temp))
+                    reason = ""
+                    # 优先级: EC 失效保护 > DTS > 固件热状态位 > 负载前馈
+                    if temp >= fs_temp:
+                        target, reason = 64, "EC %d°C>=%d°C" % (temp, fs_temp)
+                    elif self._dts_latch:
+                        target, reason = 64, "DTS %s°C" % (dts if dts is not None else "--")
+                    elif bit_hot:
+                        target, reason = 64, "固件热状态位"
+                    elif ff and boost_lv:
+                        target, reason = boost_lv, "负载 %.0f%%" % (load or 0)
+                    elif (self.current_hfsp in LEVEL_RPM and target < self.current_hfsp
+                          and dwell > 0 and (now - self._last_change) < dwell):
+                        target = self.current_hfsp      # 驻留期内不降档
                     if target != self.current_hfsp:
                         self.ec.set_fan(target)
                         self.current_hfsp = target
-                        self.say("%s  CPU=%2dC  RPM=%4d  -> 档位 0x%02X (%s RPM)"
-                                 % (time.strftime("%H:%M:%S"), temp, rpm, target,
-                                    LEVEL_RPM.get(target, "?")))
+                        self._last_change = now
+                        self._last_reason = reason
+                        self.say("%s  CPU=%dC%s  RPM=%d  -> 档位 0x%02X (%s RPM)%s"
+                                 % (time.strftime("%H:%M:%S"), temp,
+                                    (" DTS=%dC" % dts) if dts is not None else "",
+                                    rpm, target, LEVEL_RPM.get(target, "?"),
+                                    ("   [" + reason + "]") if reason else ""))
                     # 无变化不写日志 (保护 SSD; 状态随时看托盘悬停)
                 elif mode == "manual":
                     manual = self.manual_level
-                    target = 64 if temp >= fs_temp else manual
-                    if temp >= fs_temp and manual != 64:
-                        self.say("!! 失效保护: CPU %dC >= %dC, 手动档临时拉满速" % (temp, fs_temp))
+                    hot = temp >= fs_temp or self._dts_latch or bit_hot
+                    target = 64 if hot else manual
+                    if hot and manual != 64:
+                        self.say("!! 失效保护: CPU %dC / DTS %sC, 手动档临时拉满速"
+                                 % (temp, dts if dts is not None else "--"))
                     if target != self.current_hfsp:
                         self.ec.set_fan(target)
                         self.current_hfsp = target
+                        self._last_change = now
                         self.say("%s  手动模式: 档位 %s (0x%02X, %s RPM)"
                                  % (time.strftime("%H:%M:%S"),
                                     "满速" if manual == 64 else manual,
@@ -408,6 +634,7 @@ class FanController(object):
                     if self.current_hfsp != 64:
                         self.ec.set_fan(64)
                         self.current_hfsp = 64
+                        self._last_change = now
                         self.say("%s  最强散热: 满速 0x40 (%s RPM)"
                                  % (time.strftime("%H:%M:%S"),
                                     LEVEL_RPM.get(64, "?")))
@@ -425,7 +652,12 @@ class FanController(object):
         except Exception as exc:
             self.say("收尾写入失败: %s" % exc)
         finally:
-            self.ec.close()
+            try:
+                self.ec.close()
+            except Exception:
+                pass
+            if self.msr is not None:
+                self.msr.close()
 
     def _read_hfsp(self):
         try:
@@ -578,9 +810,17 @@ def tray_updater(ctrl, icon):
         try:
             temp, rpm = ctrl.last_temp, ctrl.last_rpm
             warn = "  ⚠未生效" if ctrl.last_err else ""
-            icon.title = "FanControl %s%s  CPU %s  %s RPM" % (
+            extra = ""
+            if ctrl.last_dts is not None:
+                extra += "  DTS %d°C" % ctrl.last_dts
+            if ctrl.last_load is not None:
+                extra += "  负载 %.0f%%" % ctrl.last_load
+            if ctrl.ff_active:
+                extra += " [前馈]"
+            icon.title = "FanControl %s%s  CPU %s%s  %s RPM" % (
                 _mode_text(ctrl), warn,
                 ("%d°C" % temp) if temp is not None else "--",
+                extra,
                 rpm if rpm is not None else "--")
             icon.icon = make_icon_image(ctrl)
         except Exception:
@@ -711,16 +951,71 @@ def check_single_instance():
     return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
 
 
+# ==========================================================================
+def selftest():
+    """离线自测: 曲线/滞回、负载前馈状态机、DTS 换算。不碰 EC / MSR。"""
+    fails = []
+
+    def check(name, got, want):
+        ok = (got == want)
+        if not ok:
+            fails.append(name)
+        print("  [%s] %-34s got=%-5s want=%s" % ("OK" if ok else "!!", name, got, want))
+
+    print("== 1. 曲线决策 (EC 0x78 刻度, 滞回 3) ==")
+    curve = DEFAULT_CONFIG["curve"]
+    cur = 1
+    for temp in [30, 44, 45, 54, 55, 64, 65, 74, 75, 78, 79, 83, 84, 90,
+                 83, 81, 80, 78, 76, 75, 70, 65, 60, 50, 40]:
+        cur = decide_level(temp, curve, cur, 3)
+        print("  %2dC -> 0x%02X (%s RPM)" % (temp, cur, LEVEL_RPM.get(cur, "?")))
+    check("最低档是 0x01 不是停转", decide_level(30, curve, 1, 3), 1)
+    check("45C -> 1 档", decide_level(45, curve, 1, 3), 1)
+    check("55C -> 2 档", decide_level(55, curve, 1, 3), 2)
+    check("65C -> 3 档", decide_level(65, curve, 1, 3), 3)
+    check("75C -> 6 档", decide_level(75, curve, 3, 3), 6)
+    check("79C -> 7 档", decide_level(79, curve, 6, 3), 7)
+    check("84C -> 满速", decide_level(84, curve, 7, 3), 64)
+    check("滞回: 81C 仍满速", decide_level(81, curve, 64, 3), 64)
+    check("滞回: 80C 退到 7 档", decide_level(80, curve, 64, 3), 7)
+
+    print("== 2. 负载前馈状态机 (70% / 10s 进, 55% / 10s 出) ==")
+    ff = LoadFeedforward()
+    check("初始未激活", ff.active, False)
+    ff.update(90, 0, 70, 10, 55, 10)
+    check("90% 只持续 5 秒", ff.update(90, 5, 70, 10, 55, 10), False)
+    check("90% 满 10 秒 -> 激活", ff.update(90, 10, 70, 10, 55, 10), True)
+    check("掉到 60% 不解除(>55)", ff.update(60, 11, 70, 10, 55, 10), True)
+    check("掉到 40% 第 1 秒仍激活", ff.update(40, 12, 70, 10, 55, 10), True)
+    check("40% 只过了 9 秒", ff.update(40, 21, 70, 10, 55, 10), True)
+    check("40% 满 10 秒 -> 解除", ff.update(40, 22, 70, 10, 55, 10), False)
+    check("读数 None 保持现状", ff.update(None, 40, 70, 10, 55, 10), False)
+    ff2 = LoadFeedforward()
+    ff2.update(65, 0, 70, 10, 55, 10)
+    check("65% 不算高负载", ff2.update(65, 20, 70, 10, 55, 10), False)
+    ff3 = LoadFeedforward()
+    ff3.update(70, 0, 70, 10, 55, 10)
+    check("边界 70% 满 10 秒", ff3.update(70, 10, 70, 10, 55, 10), True)
+
+    print("== 3. DTS 换算 (TjMax - 余量) ==")
+    def dts_temp(tjmax, raw):
+        return tjmax - ((raw >> 16) & 0x7F)
+    check("TjMax=100 余量=8  -> 92°C", dts_temp(100, 8 << 16), 92)
+    check("TjMax=100 余量=20 -> 80°C", dts_temp(100, 20 << 16), 80)
+    check("余量 0 -> 100°C (TjMax)", dts_temp(100, 0), 100)
+
+    print("")
+    if fails:
+        print("失败 %d 项: %s" % (len(fails), ", ".join(fails)))
+        return 1
+    print("全部通过。")
+    return 0
+
+
 def main():
     console = "--console" in sys.argv
     if "--selftest" in sys.argv:
-        print("== 曲线决策自测 (不碰 EC) ==")
-        curve = DEFAULT_CONFIG["curve"]
-        cur = 0
-        for temp in [36, 39, 41, 45, 50, 55, 60, 63, 65, 70, 75, 80, 83, 85, 86, 78, 74, 71, 65, 60, 55, 50, 45, 40, 36]:
-            cur = decide_level(temp, curve, cur, 3)
-            print("  %2dC -> 0x%02X (%s RPM)" % (temp, cur, LEVEL_RPM.get(cur, "?")))
-        return 0
+        return selftest()
 
     if not check_single_instance():
         print("FanControl 已在运行 (托盘图标), 本次退出。")

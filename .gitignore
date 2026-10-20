@@ -8,5 +8,8 @@ build/
 dist/
 *.pyc
 
+# 本地备份（时间戳后缀，不进仓库）
+*.bak-*
+
 # 捆绑的 Python 运行时（46MB，不进仓库；由部署时复制）
 runtime/
