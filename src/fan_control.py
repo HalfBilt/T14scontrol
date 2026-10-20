@@ -513,9 +513,7 @@ class FanController(object):
         #   托盘已删, 没人改配置了, 所以这里把 config 同步成当前默认(只补齐缺的/过时的键)。
         if self._sync_config_to_defaults():
             self.cfg.update({k: v for k, v in DEFAULT_CONFIG.items()
-                              if k in ("mode", "hysteresis", "dts_max_c",
-                                       "dwell_s", "max_exit_c", "cycle_sec", "tick_sec",
-                                       "backend")})
+                              if k in ("mode", "backend")})
         if self.mode not in ("smart", "manual", "max", "auto"):
             self.mode = "manual" if self.mode == "silent" else "smart"
             self.cfg["mode"] = self.mode
@@ -569,14 +567,18 @@ class FanController(object):
             return dict(DEFAULT_CONFIG)
 
     def _sync_config_to_defaults(self):
-        """把 config.json 里过时的键同步成当前默认值(返回 True 表示动过)。
-        背景: config 是旧托盘时代留下的(mode=auto / 旧曲线 / dts 92 / dwell 25),
-        而 _load_config 是"config 覆盖默认值" -> 旧值会把新默认全顶掉,
-        表现为"风扇几乎不转"(mode=auto 时档位完全交给固件)。
+        """把 config.json 里**会导致功能失效**的两个键纠正过来(返回 True 表示动过)。
+
+        ★2026-10-20 收窄: 原来这里会把 mode/curve/hysteresis/dts_max_c/dwell_s/max_exit_c/
+        cycle_sec/tick_sec/backend 九个键一律同步成 DEFAULT_CONFIG —— 于是用户改 config.json
+        调曲线或驻留, 重启就被静默改回代码默认值, "改配置"根本存不住。
+          现在只兜两个**写错就出事**的键:
+            · mode   = smart  (旧托盘写过 auto -> 完全交还固件 -> 60~63°C 只给 0x01, 即"风扇几乎不转")
+            · backend = tsctl (PawnIO 已删, 写别的打不开 EC)
+          其余一律以 config.json 为准(它才是调参入口)。
         """
         need = {k: v for k, v in DEFAULT_CONFIG.items()
-                 if k in ("mode", "curve", "hysteresis", "dts_max_c", "dwell_s",
-                          "max_exit_c", "cycle_sec", "tick_sec", "backend")
+                 if k in ("mode", "backend")
                  and self.cfg.get(k) != v}
         if not need:
             return False
