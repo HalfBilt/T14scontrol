@@ -462,7 +462,10 @@ def decide_level(temp, curve, current, hysteresis, max_exit=None):
     if target >= current:
         return target
     if max_exit is not None and current == curve[-1][1]:
-        return current if temp >= max_exit else target
+        if temp >= max_exit:
+            return current
+        lower = [lv for _t, lv in curve if lv < current]   # 退出满速也只退一级
+        return lower[-1] if lower else target
     # 降档: 找到当前档位对应的温度点
     tcur = None
     for t, lv in curve:
@@ -476,6 +479,14 @@ def decide_level(temp, curve, current, hysteresis, max_exit=None):
         tcur = curve[-1][0]
     if tcur is not None and temp >= tcur - hysteresis:
         return current
+    # ★2026-10-20 修"忽大忽小": 降档一次只降一级。
+    #   直接按曲线降会 0x06 -> 0x02 (3456 -> 2858 RPM, 一次 600 RPM 陡降),
+    #   温度稍一回升又立刻升到 3 档, 听感就是转速在两级之间来回摆。
+    #   限制每拍最多下一级(节拍 2 秒), 总下降时间只多几秒, 但转速是滑下去的。
+    if target < current:
+        lower = [lv for _t, lv in curve if lv < current]
+        if lower and target < lower[-1]:
+            target = lower[-1]
     return target
 
 
@@ -779,21 +790,29 @@ class FanController(object):
         self._control_loop(stop_evt, wake_evt, resume, pbt_name)
 
     def _pub_status(self, temp, dts, pkg, rpm):
-        """给任务栏 HUD 用的状态快照（原子写，失败不影响控制）。"""
+        """给任务栏 HUD 用的状态快照（原子写，失败不影响控制）。
+
+        节流: 数值没变且距上次写不足 10 秒就跳过（HUD 过期门限 15 秒）。
+        """
         try:
             import json as _json
             d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '..', 'status')
-            os.makedirs(d, exist_ok=True)
             obj = {
-                'ts': round(time.time(), 2),
                 'hfsp': self.current_hfsp,
                 'rpm': rpm,
                 'ec': temp,
                 'dts': dts,
                 'pkg': round(pkg, 1) if pkg is not None else None,
-                'load': self.last_load,
+                'load': round(self.last_load, 1) if self.last_load is not None else None,
                 'mode': self.mode,
             }
+            now = time.time()
+            last = getattr(self, '_pub_last', None)
+            if last and obj == last[0] and (now - last[1]) < 10.0:
+                return
+            self._pub_last = (dict(obj), now)
+            obj['ts'] = round(now, 2)
+            os.makedirs(d, exist_ok=True)
             tmp = os.path.join(d, 'fan.json.tmp')
             with open(tmp, 'w', encoding='utf-8') as fh:
                 _json.dump(obj, fh, ensure_ascii=False)
@@ -1113,6 +1132,10 @@ def selftest():
     # 满速档的触发点是 84 -> 回差 4 -> 80C 才退到曲线档(6 档); 79C 就已经退了
     check("满速退出: 关掉 max_exit 就按普通滞回(79C 仍满速)", decide_level(79, curve, 64, 4, None), 64)
     check("非满速档不受 max_exit 影响(73C 仍是 7 档)", decide_level(73, curve, 7, 4, 74.0), 7)
+    # 降档限级: 一次只下一级, 连续调用才走到底
+    check("降档限级: 6 档遇 40C 只降到 3 档", decide_level(40, curve, 6, 4), 3)
+    check("降档限级: 满速遇 40C 只降到 7 档", decide_level(40, curve, 64, 4, 74.0), 7)
+    check("降档限级: 3 档遇 40C 降到 2 档", decide_level(40, curve, 3, 4), 2)
 
     print("== 2. 负载前馈状态机 (示例参数 70% / 10s 进, 55% / 10s 出) ==")
     ff = LoadFeedforward()
