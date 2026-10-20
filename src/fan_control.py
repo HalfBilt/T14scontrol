@@ -187,12 +187,21 @@ class TSCtlBackend(object):
             spec.loader.exec_module(m)
             if not m.ensure_driver(verbose=False):
                 raise RuntimeError('TSCtl 驱动加载失败(需要管理员)')
+            # ★2026-10-20: 风扇控制循环绝不能为了等 EC 锁卡十几秒 ——
+            #   实测重载时"循环空档 10~22 秒"反复出现(29 次/共 368 秒), 就是
+            #   ec_read_strict 的 哨兵+目标+哨兵 ×2 轮 每次都等锁 3 秒叠加出来的。
+            #   这里把锁等待压到 400ms: 拿不到就当这轮没读到(用缓存值), 下轮再来。
+            m.EC_LOCK_TIMEOUT_MS = 400
             self._cpf = m
         except Exception as exc:
             raise RuntimeError('TSCtl 后端初始化失败: %s' % exc)
 
     def ec_read(self, offset):
         return self._cpf.ec_read_strict(offset)
+
+    def ec_read_fast(self, offset):
+        """只做一轮(哨兵+目标+哨兵), 拿不到立刻返回 None —— 给控制循环用。"""
+        return self._cpf.ec_read_strict(offset, tries=1)
 
     def ec_write(self, offset, value):
         return bool(self._cpf.ec_write(offset, value & 0xFF))
@@ -653,7 +662,7 @@ class FanController(object):
         """
         if self._ec_temp is None or now - self._ec_t >= self._ec_cycle:
             try:
-                raw = self.ec.ec_read(EC_CPU_TMP)
+                raw = self.ec.ec_read_fast(EC_CPU_TMP)
             except Exception as exc:
                 self._ec_bad += 1
                 if self._ec_bad in (1, 10) or self._ec_bad % 60 == 0:
@@ -700,7 +709,7 @@ class FanController(object):
         if want is None or self.current_hfsp is None:
             return False
         try:
-            real = self.ec.ec_read(EC_FAN)
+            real = self.ec.ec_read_fast(EC_FAN)
         except Exception:
             return False
         if real is None or real == want:
@@ -853,11 +862,20 @@ class FanController(object):
             ff_pkg = (self.ff_pkg.update(pkg, now, pkg_on, pkg_on_s, pkg_off, pkg_off_s)
                       if pkg_on else False)
             # DTS 自带 4°C 回差, 免得在阈值上 64<->7 来回切
+            # ★2026-10-20 优化: 硬锁存原来"一拍就锁" —— 轻载单核睿频到 88~89°C 就直接拉满速,
+            #   2 秒后掉下来又退回(实测 16:51:01 拉满 -> 16:51:03 退 6 档), 听感是"嗡一下"。
+            #   现在要求**连续两拍(4 秒)**都 >= dts_max 才锁, 且封装功耗不低于 dts_use_min_w
+            #   (轻载的单核尖峰不算整体发热)。解除仍然只要 <= dts_max-4 一拍即可。
             if dts is not None and dts_max > 0:
                 if dts >= dts_max:
-                    self._dts_latch = True
-                elif dts <= dts_max - 4:
-                    self._dts_latch = False
+                    self._dts_hi_n = getattr(self, '_dts_hi_n', 0) + 1
+                    if self._dts_hi_n >= 2 and (dts_use_w <= 0 or pkg is None
+                                               or pkg >= dts_use_w):
+                        self._dts_latch = True
+                else:
+                    self._dts_hi_n = 0
+                    if dts <= dts_max - 4:
+                        self._dts_latch = False
             # 固件热状态位(0x1B1 bit0)只在温度确实高时才认 —— 本机固件有"锁存位"
             # 的先例(EC 0x89), 不设温度门的话一个卡住的位会把风扇永久钉在满速。
             bit_hot = bool(dts_status) and dts is not None and dts_max > 0 and dts >= dts_max - 8
@@ -1013,7 +1031,7 @@ class FanController(object):
                 self.say("写档位失败: %s" % exc)
                 break
             try:
-                real = self.ec.ec_read(EC_FAN)
+                real = self.ec.ec_read_fast(EC_FAN)
             except Exception:
                 real = None
             if real is None or real == level:
@@ -1025,7 +1043,7 @@ class FanController(object):
 
     def _read_hfsp(self):
         try:
-            v = self.ec.ec_read(EC_FAN)
+            v = self.ec.ec_read_fast(EC_FAN)
             self.current_hfsp = v
             return v
         except Exception:
