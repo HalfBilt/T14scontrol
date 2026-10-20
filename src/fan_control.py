@@ -28,7 +28,9 @@ if getattr(sys, "frozen", False):
     APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
     BLOB_PATH = os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "LpcACPIEC.bin")
 else:
-    APP_DIR = SCRIPT_DIR
+    # 源码运行: src/ 的上一级 = T14scontrol\fan, 配置/日志放那里,
+    # 这样和 exe 版行为一致(重装/换 src 都不会丢配置)
+    APP_DIR = os.path.dirname(SCRIPT_DIR)
     BLOB_PATH = os.path.join(SCRIPT_DIR, "LpcACPIEC.bin")
 LOG_PATH   = os.path.join(APP_DIR, "fan_control.log")
 CONF_PATH  = os.path.join(APP_DIR, "config.json")
@@ -40,29 +42,36 @@ if getattr(sys, "frozen", False):
     EXE_FOR_TASK = os.path.abspath(sys.executable)
 else:
     _exe = os.path.join(APP_DIR, "FanControl.exe")
-    EXE_FOR_TASK = _exe if os.path.isfile(_exe) else None
+    _bat = os.path.join(APP_DIR, "FanControl.bat")
+    EXE_FOR_TASK = _exe if os.path.isfile(_exe) else (_bat if os.path.isfile(_bat) else None)
 
 # ---- EC 寄存器 (与本机实测一致) ------------------------------------------
 CTRL_PORT, DATA_PORT = 0x66, 0x62
 FLAG_OBF, FLAG_IBF   = 0x01, 0x02
 CMD_READ, CMD_WRITE  = 0x80, 0x81
-EC_FAN     = 0x2F   # HFSP
-EC_FANSW   = 0x31   # fan select
+EC_FAN     = 0x2F   # HFSP: 低3位=档位 0~7, 0x40=满速, 0x80=交还EC自动
 EC_RPM_LO  = 0x84
 EC_RPM_HI  = 0x85
 EC_CPU_TMP = 0x78
+# ★0x31(HUWB/VPON/VRST) **不要写** —— 老 IBM/X60 那代才是 fan select。
+#   本机实测写 0 和不写, 读到的转速一模一样, 但 VPON/VRST 位会被清掉。
 
-LEVEL_RPM = {0: 0, 1: 2029, 2: 2362, 3: 2600, 4: 2964,
-             5: 3185, 6: 3170, 7: 3924, 64: 4946}   # 本机实测中位转速
+# ★2026-10-20 本机全档位实测标定(手册 scripts/风扇档位-20261020-075530.txt):
+#   0x01=2471  0x02=2858  0x03=3181  0x04=3186  0x05=3167
+#   0x06=3456(低温)~3861(高温)  0x07=3858(≈6档)  0x40=4807(固定, 20~25 秒到位)
+#   ★0x03/0x04/0x05 三档挤在 ~3180, 当不了中间档; 0x07 和 0x06 只差 ~400 转。
+#   ★本机原生自动(0x80)天花板 ≈3900, 到不了 7 档 —— 所以不要指望"交还 EC"能压住温度。
+LEVEL_RPM = {0: 0, 1: 2471, 2: 2858, 3: 3181, 4: 3186,
+             5: 3167, 6: 3600, 7: 3858, 64: 4807}
 
 DEFAULT_CONFIG = {
-    "cycle_sec": 2,
+    "cycle_sec": 5,          # ★5 秒(原 2 秒): EC 是慢总线, 与 CPU 工具共用, 别太勤
     "hysteresis": 3,
     "failsafe_temp": 88,     # CPU 达到该温度无条件拉满速 0x40
     "mode": "smart",         # smart(智能) | manual(手动) | max(最强散热) | auto(EC自动,固件修复后用)
-    "manual_level": 5,       # 手动模式档位 (0-7, 64=满速)
-    "curve": [[38, 0], [40, 2], [48, 3], [55, 4],
-              [62, 5], [68, 6], [74, 7], [84, 64]],
+    "manual_level": 6,       # 手动模式档位 (0-7, 64=满速)
+    # 只用实测有意义的档: 0(停) -> 1 -> 2 -> 6 -> 64(满速)。3/4/5/7 已证明没有区分度。
+    "curve": [[40, 0], [45, 1], [50, 2], [62, 6], [84, 64]],
 }
 
 
@@ -182,12 +191,12 @@ class PawnIO(object):
             self._unlock()
 
     def set_fan(self, level):
-        self.ec_write(EC_FANSW, 0x00)
+        # ★2026-10-20: 删掉 "先写 0x31=0"。0x31 不是 FANSW, 写它会清 VPON/VRST,
+        #   而且实测转速完全不变(写/不写 3888 vs 3889 RPM)。见手册 03 §5.1。
         self.ec_write(EC_FAN, level & 0xFF)
 
     def rpm(self):
-        self.ec_write(EC_FANSW, 0x00)
-        lo = self.ec_read(EC_RPM_LO)
+        lo = self.ec_read(EC_RPM_LO)     # 先读 0x84 再读 0x85, 顺序不能反
         hi = self.ec_read(EC_RPM_HI)
         return (hi << 8) | lo
 
@@ -238,7 +247,7 @@ class FanController(object):
         self.exit_action = "keep"       # 退出永远保持当前档位 (EC 自动已失效, 不交还)
         # 运行状态
         self.mode = self.cfg.get("mode", "smart")
-        self.manual_level = int(self.cfg.get("manual_level", 5))
+        self.manual_level = int(self.cfg.get("manual_level", 6))
         if self.mode not in ("smart", "manual", "max", "auto"):
             self.mode = "manual" if self.mode == "silent" else "smart"
             self.cfg["mode"] = self.mode
@@ -316,7 +325,23 @@ class FanController(object):
 
     def _safe_snapshot(self):
         temp = self.ec.ec_read(EC_CPU_TMP)
-        rpm = self.ec.rpm()
+        # ★2026-10-20: 转速只每 6 轮(约 30 秒)读一次 —— 托盘显示不需要 5 秒级精度,
+        #   而每次读转速是 2 笔 EC 事务, 这台机器上 EC 还要和 CPU 功耗墙工具共用。
+        #   顺带核对 HFSP: 本机固件 OWAK() 里有 If(SCRM) HFSP=0x07, 唤醒后会抢回档位,
+        #   不核对的话工具会一直以为还是原来那档, 再也不重写。
+        self._tick = getattr(self, "_tick", 0) + 1
+        if self._tick % 6 == 1 or self.last_rpm is None:
+            rpm = self.ec.rpm()
+            try:
+                real = self.ec.ec_read(EC_FAN)
+                if real is not None and self.current_hfsp is not None and real != self.current_hfsp:
+                    self.say("注意: HFSP 被外部改成 0x%02X (本工具以为是 0x%02X), 已同步"
+                             % (real, self.current_hfsp))
+                    self.current_hfsp = real
+            except Exception:
+                pass
+        else:
+            rpm = self.last_rpm
         return temp, rpm
 
     # ---- control loop --------------------------------------------------------
@@ -327,7 +352,7 @@ class FanController(object):
             self.say("FATAL: EC 初始化失败: %s" % exc)
             self.say("请通过『启动风扇控制.bat』以管理员身份启动。详见 fan_control.log")
             return
-        cycle = max(1, int(self.cfg.get("cycle_sec", 2)))
+        cycle = max(1, int(self.cfg.get("cycle_sec", 5)))
         hyst = int(self.cfg.get("hysteresis", 3))
         fs_temp = int(self.cfg.get("failsafe_temp", 88))
         curve = [[int(t), int(v)] for t, v in self.cfg.get("curve", DEFAULT_CONFIG["curve"])]
@@ -484,7 +509,7 @@ def run_tray(ctrl):
         if lv == 0:
             return "停转 (0 RPM)"
         if lv == 64:
-            return "满速 0x40 (~4950 RPM)"
+            return "满速 0x40 (~4810 RPM, 需 20~25 秒到位)"
         return "%d 档 (~%s RPM)" % (lv, LEVEL_RPM.get(lv, "?"))
 
     def act_exit(icon, item):
@@ -513,7 +538,7 @@ def run_tray(ctrl):
                          pystray.Menu(*[pystray.MenuItem(
                              manual_text(lv), make_manual(lv),
                              radio=True, checked=manual_checked(lv))
-                             for lv in [0, 1, 2, 3, 4, 5, 6, 7, 64]]),
+                             for lv in [0, 1, 2, 6, 7, 64]]),
                          radio=True, checked=checked("manual")),
         pystray.MenuItem("最强散热", act_max, radio=True, checked=checked("max")),
         pystray.MenuItem("EC 自动 (备用)", act_auto, radio=True, checked=checked("auto")),
