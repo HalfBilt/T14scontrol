@@ -1,22 +1,29 @@
 ﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FanControl -- ThinkPad T14s Gen 4 智能风扇控制 (PawnIO 双模块)
+FanControl -- ThinkPad T14s Gen 4 智能风扇控制
 重写自 TPFanCtrl2 fork 的核心功能, 修复其两个缺陷:
   1) 启动时按配置文件恢复模式 (Smart/手动), 不再每次都回到 EC 自动
   2) 界面语言/模式等任何变更立即持久化到 config.json
 
-★2026-10-20 拆分后补回全部能力 (不依赖 TSCtl / ThrottleStop 驱动):
-  - 双 PawnIO 模块: LpcACPIEC(读写 EC 0x2F 等) + IntelMSR(只读 MSR)
-    ★一个句柄只能加载一个模块 —— 驱动把 blob 绑在文件对象上,
-      FsContext 已有值就返回 STATUS_ALREADY_INITIALIZED。
-      所以两个模块各开一个 PawnIO 实例(两个句柄)。
-  - DTS 快速通道: MSR 0x1B1 / 0x1A2 算出的封装温度比 EC 0x78 快 5~10 秒,
-    >= dts_max_c(92°C) 立即拉满 0x40, 不等 EC 温度爬上来。
-    MSR 不占 EC 总线, 每轮都读也不会和 CPU 功耗墙工具抢 0x62/0x66。
-  - 负载前馈: GetSystemTimes(纯 Win32 API, 免驱动), 系统占用 >= 70%
-    持续 10 秒就提前拉满; 回落到 55% 以下持续 10 秒才解除。
-  - 新曲线: 最低档用 0x01(不停转), 84°C 前插一档 7 档。
+★2026-10-20: 驱动换成 TSCtl, PawnIO 已弃用并卸载
+  原因: PawnIO 驱动**拒绝 SYSTEM 账户**(pawnio_open -> 0x80070005),
+        风扇没法做成 SYSTEM 常驻服务; TSCtl(CPU 侧一直在用)没这个问题。
+  现在直接 import CPU 侧的 CpuPLFix.py, 复用它的 EC/MSR 访问层 —— 好处:
+    · 带齐了加固: 哨兵 0xC9 / 一致性校验 / 失败刹车 / 自适应等待 /
+      "OBF 挂着就不碰"(不抢系统 ACPI EC 驱动正在等的那个字节)
+    · 两边拿同一把 'Global\\CpuPLFix-EC' 锁 -> 两进程真正串行化 ->
+      不会再出现"抢走 ACPI 数据 -> ACPI 事件 13 -> _TMP 拿不到温度 ->
+      固件报 _HOT -> 强制休眠(事件 88)"
+  功能:
+  - EC 0x2F 写档位 / 0x78 读温度 / 0x84+0x85 读转速
+  - DTS 快速通道: MSR 0x1B1 算出的封装温度比 EC 0x78 快 5~10 秒,
+    >= dts_max_c(88°C) 立即拉满 0x40, 不等 EC 温度爬上来。不占 EC 总线。
+  - 功耗前馈: RAPL(MSR 0x611) 算封装功耗, >= 45W 持续 3 秒就拉满。
+  - 负载前馈: GetSystemTimes(纯 Win32 API, 免驱动), 占用 >= 70%
+    持续 5 秒就提前拉满; 回落到 55% 以下持续 10 秒才解除。
+  - 曲线按**实测转速**排: 50°C->1档 / 62°C->2档 / 72°C->6档 / 80°C->7档 / 84°C->满速
+    (3/4/5 档实测都挤在 ~3180 RPM, 没有中间档的意义, 直接跳过)
 
 用法:
   pythonw fan_control.py            常规启动 (托盘图标)
@@ -38,17 +45,14 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if getattr(sys, "frozen", False):
     # PyInstaller 打包后: 配置/日志放 exe 旁边, 资源从解包目录取
     APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
-    BLOB_PATH = os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "LpcACPIEC.bin")
-    BLOB_MSR  = os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "IntelMSR.bin")
 else:
     # 源码运行: src/ 的上一级 = T14scontrol\fan, 配置/日志放那里,
     # 这样和 exe 版行为一致(重装/换 src 都不会丢配置)
     APP_DIR = os.path.dirname(SCRIPT_DIR)
-    BLOB_PATH = os.path.join(SCRIPT_DIR, "LpcACPIEC.bin")
-    BLOB_MSR  = os.path.join(SCRIPT_DIR, "IntelMSR.bin")
+# ★2026-10-20: CPU 侧代码目录 —— 风扇侧复用它的 TSCtl 访问层
+CPU_DIR    = os.path.join(os.path.dirname(APP_DIR), "cpu")
 LOG_PATH   = os.path.join(APP_DIR, "fan_control.log")
 CONF_PATH  = os.path.join(APP_DIR, "config.json")
-DLL_PATH   = r"C:\Program Files\PawnIO\PawnIOLib.dll"
 
 # ---- 开机自启 (计划任务) -------------------------------------------------
 TASK_NAME = "FanControl-AutoStart"
@@ -82,16 +86,20 @@ MSR_PKG_ENERGY   = 0x611   # PKG_ENERGY_STATUS, 32 位能量计数器(会回绕)
 #   0x06=3456(低温)~3861(高温)  0x07=3858(≈6档)  0x40=4807(固定, 20~25 秒到位)
 #   ★0x03/0x04/0x05 三档挤在 ~3180, 当不了中间档; 0x07 和 0x06 只差 ~400 转。
 #   ★本机原生自动(0x80)天花板 ≈3900, 到不了 7 档 —— 所以不要指望"交还 EC"能压住温度。
+# ★0x06 的实测值是 3456(低温时), 之前写 3600 是抄错的 —— 曲线按 RPM 排必须用实测值。
 LEVEL_RPM = {0: 0, 1: 2471, 2: 2858, 3: 3181, 4: 3186,
-             5: 3167, 6: 3600, 7: 3858, 64: 4807}
+             5: 3167, 6: 3456, 7: 3858, 64: 4807}
 
 DEFAULT_CONFIG = {
+    "backend": "tsctl",       # EC/MSR 后端(现在只有 TSCtl; PawnIO 已删)
     "cycle_sec": 5,          # EC 温度轮询间隔(秒): EC 是慢总线, 与 CPU 工具共用, 别太勤
     "tick_sec": 2,           # 控制决策间隔(秒): DTS/负载/功耗走 MSR+API, 不占 EC
-    "hysteresis": 3,
+    "hysteresis": 4,         # 降档回差(°C): 低于"当前档触发点 - 4"才降档
     "failsafe_temp": 88,     # EC 0x78 达到该温度无条件拉满速 0x40
     # ---- DTS 快速通道 (MSR 0x1B1, 不占 EC 总线) ----
-    "dts_max_c": 92.0,       # DTS >= 该值立即拉满 (0=关闭)
+    "dts_max_c": 88.0,       # DTS >= 该值立即拉满 (0=关闭)
+    #   ★92 -> 88: DTS 是核心温度, 比 EC 0x78 快 6~13°C。曲线里 EC 到 84 才满速,
+    #   等到 DTS 92 早就晚了(手册记的"7 档爬到 95°C"锯齿就是这么来的)。
     # 曲线输入温度 = max(EC 0x78, DTS - dts_lead_c)
     #   DTS 就是核心温度, 升载瞬时比 EC 高 6~13°C; 减 6 后与 EC 同刻度,
     #   既保留原来按 EC 标定的曲线, 又能在急升时提前 5~8 秒升档。
@@ -108,195 +116,83 @@ DEFAULT_CONFIG = {
     "load_release_pct": 55.0,   # 占用回落到该值以下
     "load_release_s": 10.0,     #   持续该秒数才解除前馈
     # ---- 降档保护 ----
-    "dwell_s": 25,           # 换档后 N 秒内不降档(防边界横跳); 0=不限制
+    "dwell_s": 60,           # 换档后 N 秒内不降档(防边界横跳); 0=不限制
+    #   ★25 -> 60: 实测日志里档位每 20~90 秒就跳一次(0x02<->0x03<->0x06),
+    #   风扇会一直"呜——呜——"地换挡。降档驻留拉长到 60 秒, 升档仍然立即。
     # 满速档的退出温度(进 84 / 退 78): 28W 满载时 7 档压不住, 不设这个值就会
     # 每 25 秒"满速<->7 档"锯齿一次(见 decide_level 注释); 0=关闭, 退化成普通滞回
-    "max_exit_c": 78.0,
+    "max_exit_c": 74.0,
+    #   ★78 -> 74: 满速的**退出**温度必须明显低于进入温度(84), 因为 0x40 要 20~25 秒
+    #   才爬到位、退回 7 档(3858)又要重新爬。实测满速与 7 档降温能力相同(ΔT 都 +33°C),
+    #   所以满速的价值是"余量", 不需要一直占着; 74°C 退出既能稳住温度,
+    #   又不会退到 7 档后立刻又热(旧值 78 退出后 7 档会一路爬到 95°C)。
     "mode": "smart",         # smart(智能) | manual(手动) | max(最强散热) | auto(EC自动,备用)
     "manual_level": 6,       # 手动模式档位 (0-7, 64=满速)
     # 曲线刻度 = 上面的"曲线输入温度"(EC 与 DTS 校准到同一刻度)
-    #   <45°C -> 1档(2471)  : 最低档用 0x01 不用 0x00, 停转后遇突发要从零起步
-    #   55°C -> 2档(2858)
-    #   65°C -> 3档(3181)
-    #   75°C -> 6档(3456~3861, 固件随温度加力)
-    #   79°C -> 7档(3858)   : 84°C 拉满之前的缓冲档
-    #   84°C -> 满速(4807)  : 0x40 要 20~25 秒才到位, 所以阈值必须靠前
-    "curve": [[45, 1], [55, 2], [65, 3], [75, 6], [79, 7], [84, 64]],
+    #   ★2026-10-20 按**实测转速**重排(旧曲线用档位号排, 3/4/5 档挤在 ~3180 转,
+    #     物理上没区别, 却占了三段温度区间 -> 温度在 45~65 之间反复换档)。
+    #   ≤50°C  -> 1档(2471)  : 最低档用 0x01 不用 0x00, 停转后遇突发要从零起步
+    #   50~62°C-> 2档(2858)  : 日常
+    #   62~72°C-> 6档(3456)  : 中载; 3/4/5 档(3181/3186/3167) 转速几乎相同, 直接跳过
+    #   72~80°C-> 7档(3858)  : 84°C 拉满之前的缓冲档
+    #   ≥84°C  -> 满速(4807)  : 0x40 要 20~25 秒才到位, 所以阈值必须靠前
+    "curve": [[50, 1], [62, 2], [72, 6], [80, 7], [84, 64]],
 }
 
 
 # ==========================================================================
-# PawnIO 访问层 (一个实例 = 一个模块; 见文件头说明, 不能共用一个句柄)
 # ==========================================================================
-class PawnIO(object):
-    def __init__(self, blob_path=None, label="LpcACPIEC"):
-        blob_path = blob_path or BLOB_PATH
-        self.label = label
-        if not os.path.isfile(DLL_PATH):
-            raise RuntimeError("找不到 PawnIOLib.dll: %s (请确认 PawnIO 驱动已安装)" % DLL_PATH)
-        if not os.path.isfile(blob_path):
-            raise RuntimeError("找不到 %s: %s" % (os.path.basename(blob_path), blob_path))
+# TSCtl 后端 (2026-10-20) —— 取代 PawnIO
+# ==========================================================================
+# 为什么换: PawnIO 驱动**拒绝 SYSTEM 账户**(pawnio_open 返回 0x80070005),
+#   所以"风扇做成 SYSTEM 服务"在 PawnIO 上走不通。TSCtl(CPU 侧一直在用)没有这个问题。
+# 怎么实现: 直接 import CPU 侧的 CpuPLFix.py, 复用它那套已加固的访问层
+#   (哨兵 0xC9 / 一致性校验 / 失败刹车 / 自适应等待 / "OBF 挂着就不碰")。
+#   顺带好处: 两边拿同一把 'Global\\CpuPLFix-EC' 锁 -> 真正串行化 ->
+#   不会再"抢走系统 ACPI EC 驱动正在等的字节" -> ACPI 事件 13 -> _TMP 失败
+#   -> 固件报 _HOT -> 强制休眠(事件 88)。
+class TSCtlBackend(object):
+    """TSCtl 端口 IO + MSR 读。接口与 PawnIO 的用法保持一致。"""
 
-        self.lib = ctypes.WinDLL(DLL_PATH)
-        L = self.lib
-        L.pawnio_open.restype = ctypes.c_int32
-        L.pawnio_open.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
-        L.pawnio_load.restype = ctypes.c_int32
-        L.pawnio_load.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
-        L.pawnio_execute.restype = ctypes.c_int32
-        L.pawnio_execute.argtypes = [
-            ctypes.c_void_p, ctypes.c_char_p,
-            ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t,
-            ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t,
-            ctypes.POINTER(ctypes.c_size_t)]
-        L.pawnio_close.restype = ctypes.c_int32
-        L.pawnio_close.argtypes = [ctypes.c_void_p]
-
-        self.handle = ctypes.c_void_p()
-        hr = L.pawnio_open(ctypes.byref(self.handle))
-        if hr < 0 or not self.handle.value:
-            raise RuntimeError("pawnio_open 失败 (0x%08X) —— 请以管理员身份运行" % (hr & 0xFFFFFFFF))
-
-        blob = open(blob_path, "rb").read()
-        hr = L.pawnio_load(self.handle, blob, len(blob))
-        if hr < 0:
-            self.close()
-            raise RuntimeError("pawnio_load(%s) 失败 (0x%08X)" % (label, hr & 0xFFFFFFFF))
-
-        self.mutex = (ctypes.windll.kernel32.CreateMutexW(None, False, u"Global\\Access_EC")
-                      if label == "LpcACPIEC" else None)
-        self._busy_since = 0.0
-
-    def _lock(self):
-        if not self.mutex:
-            return True
-        rc = ctypes.windll.kernel32.WaitForSingleObject(self.mutex, 2000)
-        return rc in (0x00000000, 0x00000080)      # WAIT_OBJECT_0 / WAIT_ABANDONED
-
-    def _unlock(self):
-        if self.mutex:
-            ctypes.windll.kernel32.ReleaseMutex(self.mutex)
-
-    def execute(self, name, in_list, out_count):
-        arr_in = (ctypes.c_uint64 * len(in_list))(*in_list) if in_list else None
-        arr_out = (ctypes.c_uint64 * out_count)() if out_count else None
-        rs = ctypes.c_size_t(0)
-        hr = self.lib.pawnio_execute(self.handle, name.encode("ascii"),
-                                     arr_in, len(in_list), arr_out, out_count,
-                                     ctypes.byref(rs))
-        if hr < 0:
-            raise RuntimeError("%s 失败 (0x%08X)" % (name, hr & 0xFFFFFFFF))
-        return [arr_out[i] for i in range(rs.value)] if (out_count and arr_out) else []
-
-    def pio_read(self, port):
-        return int(self.execute("ioctl_pio_read", [port], 1)[0]) & 0xFF
-
-    def pio_write(self, port, value):
-        self.execute("ioctl_pio_write", [port, value & 0xFF], 0)
-
-    def read_msr(self, reg):
-        """IntelMSR 模块的 ioctl_read_msr: in=[msr], out=[value]."""
-        return int(self.execute("ioctl_read_msr", [reg & 0xFFFFFFFF], 1)[0]) & 0xFFFFFFFFFFFFFFFF
-
-    def _wait(self, want_set, want_clear, timeout_ms=1000):
-        deadline = time.time() + timeout_ms / 1000.0
-        while time.time() < deadline:
-            st = self.pio_read(CTRL_PORT)
-            if (st & want_set) == want_set and (st & want_clear) == 0:
-                return True
-            time.sleep(0.002)
-        return False
-
-    def _drain(self):
-        for _ in range(10):
-            st = self.pio_read(CTRL_PORT)
-            if not (st & FLAG_OBF):
-                break
-            self.pio_read(DATA_PORT)
-            time.sleep(0.001)
-
-    def _ensure_idle(self, what):
-        """总线空闲才动手; 别人正在等数据就放弃这一轮。
-
-        ★2026-10-20(12:31:49 凉机强制休眠): 系统日志 12:31:47 报 ACPI 事件 13
-          "EC 未响应", 2 秒后 12:31:49 报 Kernel-Power 88 —— 当时 EC 只有 58°C、
-          18W, 根本不是热。链条是:
-              我们的端口事务(或 HWiNFO)把系统 ACPI EC 驱动正在等的 OBF 数据读走
-              -> 那边超时 -> DSDT 的 _TMP 拿到失败/垃圾值 -> 固件报 _HOT -> 休眠
-          所以这里改成"看到 OBF 挂着就不碰": 宁可这一轮温度沿用上次的值,
-          也不再抢别人的字节。连续 5 次都挂着才认作我们自己上次留下的残余并清掉。
-        """
-        st = self.pio_read(CTRL_PORT)
-        if st & (FLAG_IBF | FLAG_OBF):
-            # 挂了 2 秒还没人取走 -> 只能是我们自己上次失败留下的残余; 否则就让开
-            if self._busy_since and time.time() - self._busy_since > 2.0:
-                self._drain()
-                self._busy_since = 0.0
-            else:
-                if not self._busy_since:
-                    self._busy_since = time.time()
-                return False
-        else:
-            self._busy_since = 0.0
-        if not self._wait(0, FLAG_IBF | FLAG_OBF, timeout_ms=50):
-            return False
-        # 再确认一次: 刚看到空闲, 对方可能正好在这 1~2 ms 里开始写
-        time.sleep(0.002)
-        st = self.pio_read(CTRL_PORT)
-        return not (st & (FLAG_IBF | FLAG_OBF))
+    def __init__(self, cpu_dir=None):
+        self._cpf = None
+        cpu_dir = cpu_dir or CPU_DIR
+        try:
+            import importlib.util
+            path = os.path.join(cpu_dir, 'CpuPLFix.py')
+            spec = importlib.util.spec_from_file_location('cpf_shared', path)
+            m = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)
+            if not m.ensure_driver(verbose=False):
+                raise RuntimeError('TSCtl 驱动加载失败(需要管理员)')
+            self._cpf = m
+        except Exception as exc:
+            raise RuntimeError('TSCtl 后端初始化失败: %s' % exc)
 
     def ec_read(self, offset):
-        if not self._lock():
-            raise RuntimeError("EC 互斥锁超时(被 HWiNFO 等占用), 跳过读 0x%02X" % offset)
-        try:
-            if not self._ensure_idle("读 0x%02X" % offset):
-                raise RuntimeError("EC 忙(他人占用), 跳过读 0x%02X" % offset)
-            self.pio_write(CTRL_PORT, CMD_READ)
-            if not self._wait(0, FLAG_IBF):
-                raise RuntimeError("EC IBF 超时 (读 0x%02X)" % offset)
-            self.pio_write(DATA_PORT, offset)
-            if not self._wait(0, FLAG_IBF):
-                raise RuntimeError("EC IBF 超时 (读 0x%02X)" % offset)
-            return self.pio_read(DATA_PORT)
-        finally:
-            self._unlock()
+        return self._cpf.ec_read_strict(offset)
 
     def ec_write(self, offset, value):
-        if not self._lock():
-            raise RuntimeError("EC 互斥锁超时(被 HWiNFO 等占用), 跳过写 0x%02X" % offset)
-        try:
-            if not self._ensure_idle("写 0x%02X" % offset):
-                raise RuntimeError("EC 忙(他人占用), 跳过写 0x%02X" % offset)
-            self.pio_write(CTRL_PORT, CMD_WRITE)
-            if not self._wait(0, FLAG_IBF):
-                raise RuntimeError("EC IBF 超时 (写 0x%02X)" % offset)
-            self.pio_write(DATA_PORT, offset)
-            if not self._wait(0, FLAG_IBF):
-                raise RuntimeError("EC IBF 超时 (写 0x%02X)" % offset)
-            self.pio_write(DATA_PORT, value & 0xFF)
-            if not self._wait(0, FLAG_IBF):
-                raise RuntimeError("EC IBF 超时 (写 0x%02X)" % offset)
-            return True
-        finally:
-            self._unlock()
+        return bool(self._cpf.ec_write(offset, value & 0xFF))
 
     def set_fan(self, level):
-        # ★2026-10-20: 删掉 "先写 0x31=0"。0x31 不是 FANSW, 写它会清 VPON/VRST,
-        #   而且实测转速完全不变(写/不写 3888 vs 3889 RPM)。见手册 03 §5.1。
-        self.ec_write(EC_FAN, level & 0xFF)
+        """写 HFSP(0x2F)。★不写 0x31(它不是 FANSW, 写它会清 VPON/VRST, 转速也不变)。"""
+        return self.ec_write(EC_FAN, level)
 
     def rpm(self):
-        lo = self.ec_read(EC_RPM_LO)     # 先读 0x84 再读 0x85, 顺序不能反
+        lo = self.ec_read(EC_RPM_LO)
         hi = self.ec_read(EC_RPM_HI)
+        if lo is None or hi is None:
+            return None
         return (hi << 8) | lo
 
+    def read_msr(self, reg):
+        return self._cpf.rdmsr(reg)
+
     def close(self):
-        try:
-            if self.handle and self.handle.value:
-                self.lib.pawnio_close(self.handle)
-                self.handle = ctypes.c_void_p()
-        except Exception:
-            pass
+        # ★不要清掉 _cpf: 这个后端对象是 EC 通道和 DTS 通道**共用**的
+        #   (MSRThermal.close() 会调它) —— 清了就把 EC 通道也一起弄坏。
+        pass
 
 
 # ==========================================================================
@@ -315,8 +211,10 @@ class MSRThermal(object):
       32 位计数器会回绕, 所以差分用 & 0xFFFFFFFF。
     """
 
-    def __init__(self):
-        self.io = PawnIO(BLOB_MSR, "IntelMSR")
+    def __init__(self, backend=None):
+        # ★2026-10-20: 默认走 TSCtl 后端(与 EC 同一个实例, 少一个驱动句柄);
+        #   PawnIO 的 IntelMSR 模块保留为可选。
+        self.io = backend if backend is not None else TSCtlBackend()
         self.tjmax = self._read_tjmax()
         self.energy_unit = self._read_energy_unit()
         self._e_last = None
@@ -509,6 +407,12 @@ def decide_level(temp, curve, current, hysteresis, max_exit=None):
     for t, lv in curve:
         if lv == current:
             tcur = t
+    # ★2026-10-20 修一个真缺陷: 满速 0x40 不在曲线的普通档里(曲线最高档的值才是它),
+    #   所以 tcur 会是 None -> 旧代码**直接返回 target**(退到 6 档), 把回差整条绕过了,
+    #   满速档就会在 80°C 附近来回跳(进 84 退 79)。
+    #   正确做法: 满速的触发点就是曲线最高那一档的温度(84), 回差照它算。
+    if tcur is None and current == curve[-1][1]:
+        tcur = curve[-1][0]
     if tcur is not None and temp >= tcur - hysteresis:
         return current
     return target
@@ -531,17 +435,29 @@ def wake_gap(prev, now, tick):
 # 控制器
 # ==========================================================================
 class FanController(object):
-    def __init__(self, console=False):
+    def __init__(self, console=False, log_name=None):
         self.console = console
-        self.log = self._make_logger()
+        self.log = self._make_logger(log_name)
         self.cfg = self._load_config()
         self.lock = threading.Lock()
         self.ec = None
         self.stop_evt = threading.Event()
         self.exit_action = "keep"       # 退出永远保持当前档位 (EC 自动已失效, 不交还)
         # 运行状态
-        self.mode = self.cfg.get("mode", "smart")
+        # ★2026-10-20: 托盘已删除 -> mode 只能是 smart。
+        #   config.json 里若残留 mode=auto(旧托盘写的), 以前会让服务"完全交还固件",
+        #   固件在 60~63°C 只给 0x01(2471 RPM) —— 那就是"风扇几乎不转"的直接原因。
+        #   现在服务一律智能模式, 并把 config 里的 mode 改回来。
+        self.mode = "smart"
         self.manual_level = int(self.cfg.get("manual_level", 6))
+        # ★2026-10-20: config.json 里是旧值(mode=auto / 旧曲线 / dts 92 / dwell 25),
+        #   而 _load_config 是"config 覆盖默认值" -> 旧值会把新默认全顶掉。
+        #   托盘已删, 没人改配置了, 所以这里把 config 同步成当前默认(只补齐缺的/过时的键)。
+        if self._sync_config_to_defaults():
+            self.cfg.update({k: v for k, v in DEFAULT_CONFIG.items()
+                              if k in ("mode", "curve", "hysteresis", "dts_max_c",
+                                       "dwell_s", "max_exit_c", "cycle_sec", "tick_sec",
+                                       "backend")})
         if self.mode not in ("smart", "manual", "max", "auto"):
             self.mode = "manual" if self.mode == "silent" else "smart"
             self.cfg["mode"] = self.mode
@@ -568,12 +484,15 @@ class FanController(object):
         self._rpm = None
         self._rpm_t = 0.0               # 上次读转速的时间戳
         self._rpm_fast_until = 0.0      # 换档后的一段时间内把转速采样提速(见 _ec_poll)
+        self._hfsp_check_t = 0.0        # 上次核对 0x2F 的时间(见 _guard_hfsp)
         self._last_tick = 0.0           # 上一轮决策的时间戳(用于识别睡眠空档)
 
     # ---- config ----------------------------------------------------------
     def _load_config(self):
         try:
-            with open(CONF_PATH, "r", encoding="utf-8") as fh:
+            # ★用 utf-8-sig: PowerShell 的 Set-Content -Encoding UTF8 会写 BOM,
+            #   用 utf-8 读会直接抛 "Unexpected UTF-8 BOM" -> 配置被当成损坏而重建(丢设置)。
+            with open(CONF_PATH, "r", encoding="utf-8-sig") as fh:
                 cfg = json.load(fh)
             merged = dict(DEFAULT_CONFIG)
             merged.update({k: v for k, v in cfg.items() if k in DEFAULT_CONFIG})
@@ -589,6 +508,28 @@ class FanController(object):
             self.log.warning("配置损坏(%s), 已用默认配置重建", exc)
             self._write_config(DEFAULT_CONFIG)
             return dict(DEFAULT_CONFIG)
+
+    def _sync_config_to_defaults(self):
+        """把 config.json 里过时的键同步成当前默认值(返回 True 表示动过)。
+        背景: config 是旧托盘时代留下的(mode=auto / 旧曲线 / dts 92 / dwell 25),
+        而 _load_config 是"config 覆盖默认值" -> 旧值会把新默认全顶掉,
+        表现为"风扇几乎不转"(mode=auto 时档位完全交给固件)。
+        """
+        need = {k: v for k, v in DEFAULT_CONFIG.items()
+                 if k in ("mode", "curve", "hysteresis", "dts_max_c", "dwell_s",
+                          "max_exit_c", "cycle_sec", "tick_sec", "backend")
+                 and self.cfg.get(k) != v}
+        if not need:
+            return False
+        try:
+            self.cfg.update(need)
+            self._write_config(self.cfg)
+            self.say("config 已同步到当前默认: %s"
+                     % ", ".join("%s=%s" % (k, need[k]) for k in sorted(need)))
+            return True
+        except Exception as exc:
+            self.say("config 同步失败: %s" % exc)
+            return False
 
     def _write_config(self, cfg):
         tmp = CONF_PATH + ".tmp"
@@ -612,13 +553,15 @@ class FanController(object):
         self.stop_evt.set()
 
     # ---- logging ---------------------------------------------------------
-    def _make_logger(self):
-        lg = logging.getLogger("fancontrol")
+    def _make_logger(self, log_name=None):
+        """log_name=None -> fan_control.log(托盘); 给个名字则写自己的文件(服务)。"""
+        path = LOG_PATH if not log_name else os.path.join(APP_DIR, log_name)
+        lg = logging.getLogger("fancontrol" + ("." + log_name if log_name else ""))
         lg.setLevel(logging.INFO)
         if not lg.handlers:
             from logging.handlers import RotatingFileHandler
             # 单文件最大 3MB, 超出自动轮转为 .log.1 (共最多占 6MB, 永不无限增长)
-            fh = RotatingFileHandler(LOG_PATH, maxBytes=3 * 1024 * 1024,
+            fh = RotatingFileHandler(path, maxBytes=3 * 1024 * 1024,
                                      backupCount=1, encoding="utf-8")
             fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
             lg.addHandler(fh)
@@ -634,11 +577,15 @@ class FanController(object):
 
     # ---- EC / MSR -----------------------------------------------------------
     def _ec_init(self):
-        self.ec = PawnIO()
-        self.say("EC 通道就绪 (PawnIO, LpcACPIEC %d 字节)" % os.path.getsize(BLOB_PATH))
-        # DTS 通道: 独立句柄 + 独立模块, 打不开也不影响风扇主功能
+        # ★2026-10-20: 后端改成 TSCtl(可配 backend=pawnio 回退)。
+        #   TSCtl 与 CPU 侧共用驱动与 'Global\CpuPLFix-EC' 锁 -> 两进程不会插队。
+        # ★2026-10-20: 只剩 TSCtl 一个后端(PawnIO 已删: 它拒绝 SYSTEM 账户)
+        self.ec = TSCtlBackend()
+        self.say("EC 通道就绪 (TSCtl, 与 CPU 侧同一驱动/同一把锁)")
+        msr_backend = self.ec
+        # DTS 通道: 打不开也不影响风扇主功能
         try:
-            self.msr = MSRThermal()
+            self.msr = MSRThermal(msr_backend)
             t = self.msr.read()
             self.say("DTS 通道就绪 (IntelMSR, TjMax=%d, 能量单位 %.3fJ/LSB) 当前 DTS=%s"
                      % (self.msr.tjmax, self.msr.energy_unit,
@@ -688,24 +635,87 @@ class FanController(object):
                 try:
                     self._rpm = self.ec.rpm()
                     self._rpm_t = now
-                    real = self.ec.ec_read(EC_FAN)
-                    if (real is not None and self.current_hfsp is not None
-                            and real != self.current_hfsp):
-                        self.say("注意: HFSP 被外部改成 0x%02X (本工具以为是 0x%02X), 已同步"
-                                 % (real, self.current_hfsp))
-                        self.current_hfsp = real
                 except Exception:
                     pass
         return self._ec_temp, self._rpm
 
+    def _guard_hfsp(self, want):
+        """守望档位: 固件(联想 BIOS 原生曲线)会持续改写 0x2F, 把我们写的顶掉。
+
+        ★2026-10-20 实测: 压测期间固件连续把 0x2F 改成 0x06/0x03/0x02/0x07,
+          连我们写的满速 0x40 都被改成 0x03(3181 RPM) —— 这就是"风扇几乎不转"的真凶。
+        所以这里每个决策节拍(2 秒)都核对一次, 被改就立刻重写。
+        返回 True = 发生过抢档(调用方要把 want 重新下发)。
+        """
+        if want is None or self.current_hfsp is None:
+            return False
+        try:
+            real = self.ec.ec_read(EC_FAN)
+        except Exception:
+            return False
+        if real is None or real == want:
+            if real is not None:
+                self.current_hfsp = real
+            return False
+        # ★只防"变弱": 固件给的档位 >= 我们要的 -> 接受(它在帮我们降温, 别拉锯);
+        #   固件给的 < 我们要的 -> 立刻重写(挡住"固件把风扇按到最低档")。
+        #   档位比较用"风扇强度"序: 0x40(满速) > 0x07 > ... > 0x01; 0x80/0x00 视为未知,
+        #   一律重写(未知值不能当作"够强")。
+        def _strength(v):
+            if v is None:
+                return -1
+            if v == 0x40:
+                return 100
+            if v == 0x80 or v == 0x00:
+                return -1              # AUTO / 停转: 未知强度
+            return v & 0x07
+        if _strength(real) >= _strength(want):
+            self.current_hfsp = real   # 固件给得更强 -> 接受, 不写
+            return False
+        self.say("注意: HFSP 被固件改成 0x%02X(比本工具要的 0x%02X 更弱), 立刻重写"
+                 % (real, want))
+        self.current_hfsp = want
+        return True
+
+    def _wait_tick(self, tick, _stop, _wake):
+        """等下一个决策节拍。返回 True = 被"唤醒/电源事件"打断(需要立刻重读)。"""
+        if _wake is not None:
+            woke = _wake.wait(tick)
+            if woke:
+                return True
+            return False
+        self.stop_evt.wait(tick)
+        return False
+
     # ---- control loop --------------------------------------------------------
     def run(self):
+        """托盘模式: 自己管停止事件。"""
         try:
             self._ec_init()
         except Exception as exc:
             self.say("FATAL: EC 初始化失败: %s" % exc)
             self.say("请通过『启动风扇控制.bat』以管理员身份启动。详见 fan_control.log")
             return
+        self._control_loop(None, None, None, None)
+
+    def start_service_loop(self, stop_evt, wake_evt, resume, pbt_name):
+        """服务模式: 由 SCM 拉起(SYSTEM 会话, 不依赖用户登录)。
+
+        与托盘模式共用同一套控制循环, 区别只有:
+          - 停机由 SCM 的 SERVICE_CONTROL_STOP 驱动;
+          - 睡眠/休眠唤醒/拔插电 由 SCM 的 SERVICE_CONTROL_POWEREVENT 通知,
+            醒来 1 秒内立刻重写风扇档位(固件 OWAK() 会把 HFSP 抢回 0x07/0x80)。
+        """
+        try:
+            self._ec_init()
+        except Exception as exc:
+            self.say("FATAL: EC 初始化失败(服务模式): %s" % exc)
+            return
+        self.say("服务模式: 以 SYSTEM 身份接管风扇(不依赖用户登录)")
+        self._control_loop(stop_evt, wake_evt, resume, pbt_name)
+
+    def _control_loop(self, stop_evt, wake_evt, resume, pbt_name):
+        """主控制循环。stop_evt/wake_evt 为 None 表示托盘模式(用 self.stop_evt)。"""
         cycle = max(1, int(self.cfg.get("cycle_sec", 5)))
         tick = max(1.0, float(self.cfg.get("tick_sec", 2) or 2))
         self._ec_cycle = cycle
@@ -735,9 +745,26 @@ class FanController(object):
             ("占用>=%g%% 持续 %gs 拉满" % (boost_pct, boost_s)) if boost_lv else "关闭"))
         self.say("降档: 驻留 %gs | 满速档退到 %s"
                  % (dwell, ("%g°C 才退" % max_exit) if max_exit > 0 else "普通滞回"))
+        # ★2026-10-20: 启动/唤醒后**立刻**写一次档位。
+        #   实测固件每 ~30 秒按自己的曲线重写 0x2F, 温度 60~63°C 时它会选 0x01(2471 RPM)
+        #   —— 服务没在的时候就是这个状态(用户报的"风扇几乎不转")。
+        #   所以一接管就先按曲线把档位摆正, 不等下一轮决策。
+        try:
+            _t0 = self._ec_temp
+            if _t0 is not None:
+                _lv = decide_level(blend_temp(_t0, self.last_dts, dts_lead), curve,
+                                 self._read_hfsp() or 1, hyst, max_exit or None)
+                if _lv is not None:
+                    self._write_level(_lv, time.time())
+                    self.say("接管即摆正档位: -> 0x%02X (%s RPM)"
+                             % (_lv, LEVEL_RPM.get(_lv, "?")))
+        except Exception as exc:
+            self.say("接管时摆正档位失败: %s" % exc)
 
         err_count = 0
-        while not self.stop_evt.is_set():
+        _stop = stop_evt if stop_evt is not None else self.stop_evt
+        _wake = wake_evt
+        while not _stop.is_set():
             now = time.time()
             # ★休眠/唤醒检测: 内核挂起时本线程也停摆, 醒来 now 会跳一大截。
             #   立刻重读 EC 温度 + 核对 HFSP, 不等 30 秒轮询(见 wake_gap 注释)。
@@ -796,11 +823,20 @@ class FanController(object):
             try:
                 if mode == "smart":
                     if t_ctrl is None:
-                        self.stop_evt.wait(tick)
+                        self._wait_tick(tick, _stop, _wake)
                         continue
                     cur = self.current_hfsp
                     if cur is None:
                         cur = self._read_hfsp()
+                    # ★守望: 固件每 ~30 秒抢一次 0x2F; 我们每个 EC 周期(5 秒)查一次就够,
+                    #   不必每个 2 秒节拍都查(那是白白增加 EC 事务)。
+                    if (cur is not None and now - self._hfsp_check_t >= self._ec_cycle):
+                        self._hfsp_check_t = now
+                        if self._guard_hfsp(cur):
+                            try:
+                                self.ec.set_fan(cur)
+                            except Exception:
+                                pass
                     target = decide_level(t_ctrl, curve, cur, hyst, max_exit or None)
                     reason = ""
                     # 优先级: EC 失效保护 > DTS 锁存 > 固件热状态位 > 功耗 > 负载
@@ -811,9 +847,15 @@ class FanController(object):
                     elif bit_hot:
                         target, reason = 64, "固件热状态位"
                     elif ff_pkg and boost_lv:
-                        target, reason = boost_lv, "功耗 %.0fW" % (pkg or 0)
+                        # ★2026-10-20: 前馈只能"把档位往上抬", 绝不能把曲线算出的
+                        #   更高档位压下来(原来这里是赋值 target = boost_lv)。
+                        #   例子: 曲线因 EC 到了 78°C 要 7 档, 但负载前馈刚解除 ->
+                        #   原来会把它改回 boost_lv(满速)或更低, 造成"越热档位越小"。
+                        if boost_lv > target:
+                            target, reason = boost_lv, "功耗 %.0fW" % (pkg or 0)
                     elif ff and boost_lv:
-                        target, reason = boost_lv, "负载 %.0f%%" % (load or 0)
+                        if boost_lv > target:
+                            target, reason = boost_lv, "负载 %.0f%%" % (load or 0)
                     elif (self.current_hfsp in LEVEL_RPM and target < self.current_hfsp
                           and dwell > 0 and (now - self._last_change) < dwell):
                         target = self.current_hfsp      # 驻留期内不降档
@@ -856,7 +898,17 @@ class FanController(object):
             except Exception as exc:
                 self.last_err = str(exc)
                 self.say("EC 写入异常: %s" % exc)
-            self.stop_evt.wait(tick)
+            # ★服务模式: SCM 送来电源事件时立刻醒来重读(固件 OWAK() 会抢 HFSP)
+            woke = self._wait_tick(tick, _stop, _wake)
+            if woke and wake_evt is not None and resume is not None:
+                wake_evt.clear()
+                self._ec_t = 0.0
+                self._rpm_t = 0.0
+                self._rpm = None
+                self.ff.reset()
+                self.ff_pkg.reset()
+                self.say("收到电源事件 0x%04X (%s), 立即重读温度并核对档位"
+                         % (resume[0], pbt_name(resume[0]) if pbt_name else "未知"))
 
         # 收尾
         try:
@@ -874,10 +926,23 @@ class FanController(object):
     def _write_level(self, level, now):
         """写档位 + 记录时间 + 打开"转速快采样"窗口。
 
-        0x40 从写下去到爬稳要 20~25 秒, 托盘上要看得见这个过程(否则像"没执行");
-        窗口内的转速/档位核对改成每个 EC 周期(5 秒)读一次, 窗口外仍 30 秒一次。
+        0x40 从写下去到爬稳要 20~25 秒, 窗口内转速采样提速(每 5 秒)。
+        ★2026-10-20: 固件会抢 0x2F, 所以写完**立刻回读一次**确认落到目标档;
+        没落到就再写一次(最多 2 次) —— 只写不管的话, 实际转速由固件曲线说了算。
         """
-        self.ec.set_fan(level)
+        for attempt in (1, 2):
+            try:
+                self.ec.set_fan(level)
+            except Exception as exc:
+                self.say("写档位失败: %s" % exc)
+                break
+            try:
+                real = self.ec.ec_read(EC_FAN)
+            except Exception:
+                real = None
+            if real is None or real == level:
+                break
+            self.say("档位没落到目标: 写 0x%02X 回读 0x%02X, 重试" % (level, real))
         self.current_hfsp = level
         self._last_change = now
         self._rpm_fast_until = now + 35.0
@@ -892,311 +957,6 @@ class FanController(object):
 
 
 # ==========================================================================
-# 托盘图标 (pystray + Pillow) -- 风扇造型
-#   生效: 绿=智能  橙=手动  红=最强散热  蓝=EC自动
-#   未生效 (EC 通信失败): 灰色
-# ==========================================================================
-def _draw_fan(color, alpha=255):
-    """画一个三叶风扇图标 (64x64 RGBA)."""
-    import math
-    from PIL import Image, ImageDraw
-    size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    cx = cy = size / 2.0
-    col = (color[0], color[1], color[2], alpha)
-    dark = (max(color[0] - 90, 0), max(color[1] - 90, 0), max(color[2] - 90, 0), alpha)
-
-    # 三片扇叶 (水滴形, 间隔 120 度)
-    blade = [(0, -25), (9, -17), (11, -7), (4, -3), (-5, -4), (-11, -13)]
-    for i in range(3):
-        ang = math.radians(i * 120 - 90)
-        ca, sa = math.cos(ang), math.sin(ang)
-        pts = [(cx + x * ca - y * sa, cy + x * sa + y * ca) for x, y in blade]
-        d.polygon(pts, fill=col)
-
-    # 中心轮毂
-    d.ellipse([cx - 9, cy - 9, cx + 9, cy + 9], fill=(250, 250, 250, alpha),
-              outline=dark, width=2)
-    d.ellipse([cx - 3, cy - 3, cx + 3, cy + 3], fill=dark)
-
-    # 外圈
-    d.ellipse([1, 1, size - 2, size - 2], outline=(90, 90, 90, alpha), width=2)
-    return img
-
-
-def make_icon_image(ctrl):
-    if ctrl.last_err:                      # 未生效 -> 灰色
-        return _draw_fan((160, 160, 160))
-    if ctrl.mode == "max":
-        return _draw_fan((225, 55, 55))    # 最强散热 -> 红
-    if ctrl.mode == "manual":
-        return _draw_fan((240, 150, 40))   # 手动模式 -> 橙
-    if ctrl.mode == "auto":
-        return _draw_fan((70, 130, 235))   # EC 自动 -> 蓝
-    return _draw_fan((60, 185, 85))        # 智能模式 -> 绿
-
-
-def run_tray(ctrl):
-    import pystray
-
-    def act_smart(icon, item):
-        ctrl.set_mode("smart")
-
-    def act_max(icon, item):
-        ctrl.set_mode("max")
-
-    def act_auto(icon, item):
-        try:
-            ctrl.ec.set_fan(0x80)
-            ctrl.current_hfsp = 0x80
-            ctrl.say("已写 0x80, 风扇交还 EC 自动")
-        except Exception as exc:
-            ctrl.say("写 0x80 失败: %s" % exc)
-        ctrl.set_mode("auto")
-
-    def make_manual(lv):
-        def act(icon, item):
-            ctrl.set_mode("manual", lv)
-        return act
-
-    def manual_text(lv):
-        if lv == 0:
-            return "停转 (0 RPM)"
-        if lv == 64:
-            return "满速 0x40 (~4810 RPM, 需 20~25 秒到位)"
-        return "%d 档 (~%s RPM)" % (lv, LEVEL_RPM.get(lv, "?"))
-
-    def act_exit(icon, item):
-        ctrl.request_stop("keep")
-        icon.stop()
-
-    def act_autostart(icon, item):
-        on = autostart_enabled()
-        ok, _ = autostart_set(not on)
-        ctrl.say("开机自启 -> %s%s" % ("开启" if not on else "关闭",
-                  "" if ok else " (失败, 需要管理员权限)"))
-        try:
-            icon.update_menu()
-        except Exception:
-            pass
-
-    def checked(mode):
-        return lambda item: ctrl.mode == mode
-
-    def manual_checked(lv):
-        return lambda item: ctrl.mode == "manual" and ctrl.manual_level == lv
-
-    menu = pystray.Menu(
-        pystray.MenuItem("智能模式", act_smart, radio=True, checked=checked("smart")),
-        pystray.MenuItem("手动模式",
-                         pystray.Menu(*[pystray.MenuItem(
-                             manual_text(lv), make_manual(lv),
-                             radio=True, checked=manual_checked(lv))
-                             for lv in [0, 1, 2, 6, 7, 64]]),
-                         radio=True, checked=checked("manual")),
-        pystray.MenuItem("最强散热", act_max, radio=True, checked=checked("max")),
-        pystray.MenuItem("EC 自动 (备用)", act_auto, radio=True, checked=checked("auto")),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("开机自启", act_autostart,
-                         checked=lambda item: autostart_enabled()),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem(lambda item: "状态: %s%s" % (_mode_text(ctrl),
-                         "  [未生效!]" if ctrl.last_err else ""),
-                         lambda icon, item: None, enabled=False),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("退出 (保持当前状态)", act_exit),
-    )
-
-    icon = pystray.Icon("FanControl", _draw_fan((60, 185, 85)),
-                        "FanControl 启动中...", menu)
-    threading.Thread(target=tray_updater, args=(ctrl, icon), daemon=True).start()
-    icon.run_detached()
-
-
-def _mode_text(ctrl):
-    if ctrl.mode == "smart":
-        return "智能模式"
-    if ctrl.mode == "manual":
-        lv = ctrl.manual_level
-        return "手动·满速" if lv == 64 else ("手动·停转" if lv == 0 else "手动·%d 档" % lv)
-    if ctrl.mode == "max":
-        return "最强散热"
-    if ctrl.mode == "auto":
-        return "EC 自动"
-    return ctrl.mode
-
-
-def tray_updater(ctrl, icon):
-    """控制线程里定期刷新托盘 tooltip 和图标。
-
-    ★2026-10-20: 原来只显示 EC 温度(0x78, 比核心滞后 5~15°C)和 30 秒才更新一次的转速,
-      用户看到的"详细情况"和 HWiNFO 对不上。现在:
-        · EC 温度 / 核心温度(DTS) 并排显示 —— 前者是曲线输入, 后者才是机身真实热区;
-        · 转速在换档后 35 秒内每 5 秒刷新(见 _ec_poll), 并标出"(爬速中)";
-        · 附带当前档位名(满速/7档/…), 一眼能看出 0x2F 现在是什么。
-    """
-    while not ctrl.stop_evt.is_set():
-        try:
-            temp, rpm = ctrl.last_temp, ctrl.last_rpm
-            warn = "  ⚠未生效" if ctrl.last_err else ""
-            lv = ctrl.current_hfsp
-            lv_txt = ""
-            if lv is not None:
-                if lv == 64:
-                    lv_txt = "满速"
-                elif lv == 0x80:
-                    lv_txt = "EC自动"
-                elif lv == 0:
-                    lv_txt = "停转"
-                elif lv in LEVEL_RPM:
-                    lv_txt = "%d档" % lv
-            bits = [("EC %d°C" % temp) if temp is not None else "EC --"]
-            if ctrl.last_dts is not None:
-                bits.append("核心 %d°C" % ctrl.last_dts)
-            if ctrl.last_pkg is not None:
-                bits.append("%.0fW" % ctrl.last_pkg)
-            if ctrl.last_load is not None:
-                bits.append("负载 %.0f%%" % ctrl.last_load)
-            if ctrl.ff_active or ctrl.pkg_active:
-                bits.append("[前馈]")
-            rp = ("%d RPM" % rpm) if rpm is not None else "-- RPM"
-            if lv_txt:
-                rp += " " + lv_txt
-            if lv == 64 and time.time() < getattr(ctrl, "_rpm_fast_until", 0.0):
-                rp += "(爬速中)"
-            icon.title = "FanControl %s%s  |  %s  |  %s" % (
-                _mode_text(ctrl), warn, " ".join(bits), rp)
-            icon.icon = make_icon_image(ctrl)
-        except Exception:
-            pass
-        ctrl.stop_evt.wait(2)
-
-
-# ==========================================================================
-# 开机自启 (计划任务 FanControl-AutoStart, 登录延迟 15 秒, 最高权限)
-# ==========================================================================
-def _schtasks(args):
-    """运行 schtasks, 返回 (返回码, 输出文本). XML 输出为 UTF-16, 其余忽略即可."""
-    try:
-        p = subprocess.run(["schtasks"] + args, capture_output=True)
-        try:
-            out = p.stdout.decode("utf-16", "ignore") if b"\x00" in (p.stdout or b"")[:4] \
-                else p.stdout.decode("gbk", "ignore")
-        except Exception:
-            out = ""
-        return p.returncode, out
-    except Exception as exc:
-        return -1, str(exc)
-
-
-def autostart_task_command():
-    """返回自启任务的 Command 路径 (未去引号原样); 任务不存在返回 None."""
-    rc, out = _schtasks(["/Query", "/TN", TASK_NAME, "/XML"])
-    if rc != 0:
-        return None
-    m = re.search(r"<Command>(.*?)</Command>", out)
-    return m.group(1) if m else ""
-
-
-def autostart_enabled():
-    """自启任务存在且指向当前 exe 才算已开启."""
-    if not EXE_FOR_TASK:
-        return False
-    cmd = autostart_task_command()
-    if not cmd:
-        return False
-    try:
-        return os.path.normpath(os.path.abspath(cmd.strip().strip('"'))) \
-            == os.path.normpath(EXE_FOR_TASK)
-    except Exception:
-        return False
-
-
-def _task_settings_fix():
-    """把计划的电池两条限制改成 false.
-
-    schtasks /Create 一定写死 DisallowStartIfOnBatteries=true /
-    StopIfGoingOnBatteries=true —— 后果是**用电池开机时风扇工具根本不会启动**,
-    而笔记本恰恰最需要不插电时也有风扇控制。schtasks 命令行没有对应开关,
-    只能用 PowerShell 的 ScheduledTasks 模块改。
-    """
-    ps = ("$n='%s'; try{ $t=Get-ScheduledTask -TaskName $n -ErrorAction Stop;"
-          "  $t.Settings.DisallowStartIfOnBatteries=$false;"
-          "  $t.Settings.StopIfGoingOnBatteries=$false;"
-          "  $t.Settings.ExecutionTimeLimit='PT0S';"
-          "  Set-ScheduledTask -TaskName $n -Settings $t.Settings | Out-Null;"
-          "  exit 0 } catch { exit 1 }" % TASK_NAME)
-    try:
-        p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                           capture_output=True, creationflags=0x08000000)
-        return p.returncode == 0
-    except Exception:
-        return False
-
-
-def _task_allows_battery():
-    """任务是否没被"电池就不跑"挡住; 查不到当没挡(不乱动)."""
-    rc, out = _schtasks(["/Query", "/TN", TASK_NAME, "/XML"])
-    if rc != 0:
-        return True
-    m = re.search(r"<DisallowStartIfOnBatteries>\s*(true|false)\s*</DisallowStartIfOnBatteries>",
-                  out, re.I)
-    return not (m and m.group(1).lower() == "true")
-
-
-def autostart_set(enable):
-    """开启/关闭开机自启. 需要管理员权限 (程序本身已提权)."""
-    if not EXE_FOR_TASK:
-        return False, "无法定位 FanControl.exe"
-    if enable:
-        rc, out = _schtasks(["/Create", "/F", "/TN", TASK_NAME,
-                             "/TR", '"%s"' % EXE_FOR_TASK,
-                             "/SC", "ONLOGON", "/DELAY", "0000:15",
-                             "/RL", "HIGHEST"])
-        if rc != 0:
-            return False, out
-        ok2 = _task_settings_fix()
-        return True, out + ("" if ok2
-                            else " [警告] 电池设置没改成功: 用电池开机时不会自启")
-    rc, out = _schtasks(["/Delete", "/TN", TASK_NAME, "/F"])
-    return rc == 0, out
-
-
-def autostart_autofix(ctrl):
-    """启动时自查自启任务: 指向旧路径 / 被"电池不跑"挡住 就顺手修正."""
-    if not EXE_FOR_TASK:
-        return
-    try:
-        cmd = autostart_task_command()
-        if cmd is None:
-            return
-        if not autostart_enabled():
-            ok, _ = autostart_set(True)
-            ctrl.say("开机自启路径已修正 -> %s%s"
-                     % (EXE_FOR_TASK, "" if ok else " (修正失败)"))
-        elif not _task_allows_battery():
-            ok = _task_settings_fix()
-            ctrl.say("开机自启已解除电池限制%s"
-                     % ("" if ok else " (失败, 需管理员)"))
-    except Exception:
-        pass
-
-
-# ==========================================================================
-def check_admin():
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
-
-
-def check_single_instance():
-    ctypes.windll.kernel32.CreateMutexW(None, True, u"FanControl_T14s_SingleInstance")
-    return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
-
-
-# ==========================================================================
 def selftest():
     """离线自测: 曲线/滞回、负载前馈状态机、DTS 换算。不碰 EC / MSR。"""
     fails = []
@@ -1207,27 +967,29 @@ def selftest():
             fails.append(name)
         print("  [%s] %-34s got=%-5s want=%s" % ("OK" if ok else "!!", name, got, want))
 
-    print("== 1. 曲线决策 (EC 0x78 刻度, 滞回 3) ==")
+    print("== 1. 曲线决策 (EC 0x78 刻度, 滞回 4; 新曲线按实测 RPM 排) ==")
     curve = DEFAULT_CONFIG["curve"]
     cur = 1
-    for temp in [30, 44, 45, 54, 55, 64, 65, 74, 75, 78, 79, 83, 84, 90,
-                 83, 81, 80, 78, 76, 75, 70, 65, 60, 50, 40]:
-        cur = decide_level(temp, curve, cur, 3)
+    for temp in [30, 49, 50, 60, 62, 70, 72, 78, 80, 83, 84, 90,
+                 83, 79, 76, 74, 72, 66, 62, 55, 50, 40]:
+        cur = decide_level(temp, curve, cur, 4)
         print("  %2dC -> 0x%02X (%s RPM)" % (temp, cur, LEVEL_RPM.get(cur, "?")))
-    check("最低档是 0x01 不是停转", decide_level(30, curve, 1, 3), 1)
-    check("45C -> 1 档", decide_level(45, curve, 1, 3), 1)
-    check("55C -> 2 档", decide_level(55, curve, 1, 3), 2)
-    check("65C -> 3 档", decide_level(65, curve, 1, 3), 3)
-    check("75C -> 6 档", decide_level(75, curve, 3, 3), 6)
-    check("79C -> 7 档", decide_level(79, curve, 6, 3), 7)
-    check("84C -> 满速", decide_level(84, curve, 7, 3), 64)
-    check("滞回: 81C 仍满速", decide_level(81, curve, 64, 3), 64)
-    check("滞回: 80C 退到 7 档", decide_level(80, curve, 64, 3), 7)
-    check("满速退出: 79C 仍满速(退 78)", decide_level(79, curve, 64, 3, 78.0), 64)
-    check("满速退出: 78C 踩线仍满速", decide_level(78, curve, 64, 3, 78.0), 64)
-    check("满速退出: 77C 才退", decide_level(77, curve, 64, 3, 78.0), 6)
-    check("满速退出: 关掉就按普通滞回(80C 退)", decide_level(80, curve, 64, 3, None), 7)
-    check("非满速档不受 max_exit 影响", decide_level(77, curve, 7, 3, 78.0), 7)
+    check("最低档是 0x01 不是停转", decide_level(30, curve, 1, 4), 1)
+    check("49C -> 1 档", decide_level(49, curve, 1, 4), 1)
+    check("50C -> 1 档", decide_level(50, curve, 1, 4), 1)
+    check("62C -> 2 档", decide_level(62, curve, 1, 4), 2)
+    check("72C -> 6 档(跳过没意义的 3/4/5)", decide_level(72, curve, 2, 4), 6)
+    check("80C -> 7 档", decide_level(80, curve, 6, 4), 7)
+    check("84C -> 满速", decide_level(84, curve, 7, 4), 64)
+    check("滞回: 81C 仍满速", decide_level(81, curve, 64, 4), 64)
+    # 满速档的回差基准是它自己的触发点 84°C: 80C >= 84-4 -> 仍保持满速
+    check("滞回: 80C 仍满速(回差基准=满速触发点 84)", decide_level(80, curve, 64, 4), 64)
+    check("满速退出: 75C 仍满速(退 74)", decide_level(75, curve, 64, 4, 74.0), 64)
+    check("满速退出: 74C 踩线仍满速", decide_level(74, curve, 64, 4, 74.0), 64)
+    check("满速退出: 73C 才退", decide_level(73, curve, 64, 4, 74.0), 6)
+    # 满速档的触发点是 84 -> 回差 4 -> 80C 才退到曲线档(6 档); 79C 就已经退了
+    check("满速退出: 关掉 max_exit 就按普通滞回(79C 退到 6 档)", decide_level(79, curve, 64, 4, None), 6)
+    check("非满速档不受 max_exit 影响(73C 退到 6 档)", decide_level(73, curve, 7, 4, 74.0), 6)
 
     print("== 2. 负载前馈状态机 (示例参数 70% / 10s 进, 55% / 10s 出) ==")
     ff = LoadFeedforward()
@@ -1263,9 +1025,9 @@ def selftest():
     check("无 DTS: 退回 EC", blend_temp(70, None, 6), 70)
     check("无 EC: 用 DTS-lead", blend_temp(None, 80, 6), 74)
     check("实际效果 73/86 进 7 档",
-          decide_level(blend_temp(73, 86, 6), curve, 3, 3), 7)
-    check("实际效果 70/76 仍是 3 档",
-          decide_level(blend_temp(70, 76, 6), curve, 3, 3), 3)
+          decide_level(blend_temp(73, 86, 6), curve, 6, 4), 7)
+    check("实际效果 70/76 仍是 2 档",
+          decide_level(blend_temp(70, 76, 6), curve, 2, 4), 2)
 
     print("== 5. EC 温度哨兵 ==")
     check("正常 25°C", ec_temp_ok(25), True)
@@ -1290,45 +1052,26 @@ def selftest():
 
 
 def main():
-    console = "--console" in sys.argv
+    """入口。★2026-10-20: 托盘已删除(用户要求开机默认就是智能模式)。
+    现在只有三种跑法:
+      --service   作为 Windows 服务(SYSTEM 常驻; 由 fan_service_ctl.py 注册)
+      --console   前台跑, 日志打到控制台(调试用)
+      --selftest  离线自测曲线/前馈/温度换算, 不碰 EC
+    """
     if "--selftest" in sys.argv:
         return selftest()
-
-    if not check_single_instance():
-        print("FanControl 已在运行 (托盘图标), 本次退出。")
-        return 0
-
-    ctrl = FanController(console=console)
-    if not check_admin():
-        ctrl.say("警告: 未以管理员身份运行, PawnIO 可能打不开 EC!")
-
+    if "--service" in sys.argv:
+        # 服务模式: 真正的循环在 FanControlSvc.py 里(SCM 驱动停机/电源事件)
+        print("请用 FanControlSvc.py --service 启动服务, 不要直接跑本文件。")
+        return 2
+    ctrl = FanController(console=("--console" in sys.argv))
     t = threading.Thread(target=ctrl.run, daemon=True)
     t.start()
-
     try:
-        run_tray(ctrl)
-        # pystray run_detached 需要 mainloop 由我们驱动
-        import pystray
-        # run_detached 已自带线程, 这里阻塞等待控制线程结束
         while t.is_alive():
             time.sleep(0.5)
-    except ImportError:
-        # 没有 pystray: 控制台模式兜底
-        ctrl.say("pystray 不可用, 使用纯控制台模式 (Ctrl+C 退出)")
-        try:
-            while t.is_alive():
-                time.sleep(0.5)
-        except KeyboardInterrupt:
-            ctrl.request_stop("keep")
-    except Exception as exc:
-        ctrl.say("托盘初始化失败(%s), 转控制台模式" % exc)
-        try:
-            while t.is_alive():
-                time.sleep(0.5)
-        except KeyboardInterrupt:
-            ctrl.request_stop("keep")
+    except KeyboardInterrupt:
+        ctrl.request_stop("keep")
     return 0
-
-
 if __name__ == "__main__":
     sys.exit(main())

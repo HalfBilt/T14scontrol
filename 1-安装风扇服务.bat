@@ -1,0 +1,30 @@
+@echo off
+rem ============================================================
+rem  T14s 智能风扇控制 —— 安装为 Windows 服务(SYSTEM 常驻)
+rem  不依赖用户登录; 睡眠唤醒后 1 秒内接管风扇档位
+rem ============================================================
+cd /d "%~dp0"
+if "%FCS_ELEV%"=="1" goto run
+fltmc >nul 2>&1
+if %errorlevel%==0 goto run
+set FCS_ELEV=1
+echo Requesting administrator privileges...
+powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+exit /b
+:run
+if exist "%~dp0runtime\python.exe" goto ctl
+if exist "%~dp0runtime.zip" (
+  echo Expanding bundled Python runtime...
+  tar -xf "%~dp0runtime.zip" -C "%~dp0"
+)
+if exist "%~dp0runtime\python.exe" goto ctl
+echo [X] runtime not found (runtime.zip missing?)
+pause
+exit /b 1
+:ctl
+"%~dp0runtime\python.exe" "%~dp0src\fan_service_ctl.py" install
+echo.
+"%~dp0runtime\python.exe" "%~dp0src\fan_service_ctl.py" status
+echo.
+echo 日志: %~dp0fan_service.log
+pause
