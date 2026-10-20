@@ -25,7 +25,7 @@
 
 - 日志：`fan_service.log`（服务）/ `fan_control.log`（前台调试模式）
 - 配置：`config.json`（改完 60 秒内生效，或重启服务）
-- 离线自测：`runtime\python.exe src\fan_control.py --selftest`
+- 离线自测：`..\runtime\python.exe src\fan_control.py --selftest`
 
 ## 模式
 
@@ -100,7 +100,7 @@
 ```
 ├── src/            Python 源码（fan_control.py 主程序 / FanControlSvc.py 服务入口 /
 │                   fan_service_ctl.py 服务注册工具）
-├── runtime/        自带 Python 运行时
+（运行时已上移：`..untime\` 与 CPU 侧共用一套）
 └── docs/           详细使用说明
 ```
 
