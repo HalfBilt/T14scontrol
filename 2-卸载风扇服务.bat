@@ -1,5 +1,9 @@
 @echo off
-rem åœç”¨å¹¶åˆ é™¤ T14s æ™ºèƒ½é£Žæ‰‡æŽ§åˆ¶æœåŠ¡(éœ€è¦ç®¡ç†å‘˜)
+rem ---- console codepage adaptive: keep Python output readable ----
+for /f "tokens=2 delims=: " %%c in ('chcp') do set "CP=%%c"
+if "%CP%"=="936" set "PYTHONIOENCODING=gbk"
+if "%CP%"=="65001" set "PYTHONIOENCODING=utf-8"
+rem Í£ÓÃ²¢É¾³ý T14s ÖÇÄÜ·çÉÈ¿ØÖÆ·þÎñ(ÐèÒª¹ÜÀíÔ±)
 cd /d "%~dp0"
 if "%FCS_ELEV%"=="1" goto run
 fltmc >nul 2>&1

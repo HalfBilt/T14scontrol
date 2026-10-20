@@ -1,7 +1,11 @@
 @echo off
+rem ---- console codepage adaptive: keep Python output readable ----
+for /f "tokens=2 delims=: " %%c in ('chcp') do set "CP=%%c"
+if "%CP%"=="936" set "PYTHONIOENCODING=gbk"
+if "%CP%"=="65001" set "PYTHONIOENCODING=utf-8"
 rem ============================================================
-rem  T14s æ™ºèƒ½é£æ‰‡æ§åˆ¶ â€”â€” å®‰è£…ä¸º Windows æœåŠ¡(SYSTEM å¸¸é©»)
-rem  ä¸ä¾èµ–ç”¨æˆ·ç™»å½•; ç¡çœ å”¤é†’å 1 ç§’å†…æ¥ç®¡é£æ‰‡æ¡£ä½
+rem  T14s ÖÇÄÜ·çÉÈ¿ØÖÆ ¡ª¡ª °²×°Îª Windows ·şÎñ(SYSTEM ³£×¤)
+rem  ²»ÒÀÀµÓÃ»§µÇÂ¼; Ë¯Ãß»½ĞÑºó 1 ÃëÄÚ½Ó¹Ü·çÉÈµµÎ»
 rem ============================================================
 cd /d "%~dp0"
 if "%FCS_ELEV%"=="1" goto run
@@ -13,11 +17,6 @@ powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
 exit /b
 :run
 if exist "%~dp0..\runtime\python.exe" goto ctl
-if exist "%~dp0..\runtime.zip" (
-  echo Expanding bundled Python runtime...
-  tar -xf "%~dp0..\runtime.zip" -C "%~dp0..\"
-)
-if exist "%~dp0..\runtime\python.exe" goto ctl
 echo [X] runtime not found - expecting ..\runtime\python.exe (shared runtime).
 pause
 exit /b 1
@@ -26,5 +25,5 @@ exit /b 1
 echo.
 "%~dp0..\runtime\python.exe" "%~dp0src\fan_service_ctl.py" status
 echo.
-echo æ—¥å¿—: %~dp0fan_service.log
+echo ÈÕÖ¾: %~dp0fan_service.log
 pause

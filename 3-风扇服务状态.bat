@@ -1,17 +1,17 @@
 @echo off
-rem æŸ¥çœ‹ T14s é£æ‰‡æœåŠ¡çŠ¶æ€ + æœ€è¿‘æ—¥å¿—(ä¸éœ€è¦ç®¡ç†å‘˜)
+rem ---- console codepage adaptive: keep Python output readable ----
+for /f "tokens=2 delims=: " %%c in ('chcp') do set "CP=%%c"
+if "%CP%"=="936" set "PYTHONIOENCODING=gbk"
+if "%CP%"=="65001" set "PYTHONIOENCODING=utf-8"
+rem ²é¿´ T14s ·çÉÈ·şÎñ×´Ì¬ + ×î½üÈÕÖ¾(²»ĞèÒª¹ÜÀíÔ±)
 cd /d "%~dp0"
 "%~dp0..\runtime\python.exe" "%~dp0src\fan_service_ctl.py" status
 echo.
 if exist "%~dp0fan_service.log" (
-  echo ==== fan_service.log æœ€è¿‘ 25 è¡Œ ====
-  powershell -NoProfile -Command "Get-Content -LiteralPath '%~dp0fan_service.log' -Tail 25"
+  echo ==== fan_service.log ×î½ü 25 ĞĞ ====
+  powershell -NoProfile -Command "Get-Content -LiteralPath '%~dp0fan_service.log' -Encoding UTF8 -Tail 25"
 ) else (
-  echo (è¿˜æ²¡æœ‰ fan_service.log)
+  echo (»¹Ã»ÓĞ fan_service.log)
 )
 echo.
-if exist "%~dp0fan_control.log" (
-  echo ==== fan_control.log(æ—§æ‰˜ç›˜)æœ€è¿‘ 10 è¡Œ ====
-  powershell -NoProfile -Command "Get-Content -LiteralPath '%~dp0fan_control.log' -Tail 10"
-)
 pause

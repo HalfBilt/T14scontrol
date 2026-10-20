@@ -1,5 +1,9 @@
 @echo off
-rem 閲嶅惎 T14s 椋庢墖鏈嶅姟(闇�瑕佺鐞嗗憳)
+rem ---- console codepage adaptive: keep Python output readable ----
+for /f "tokens=2 delims=: " %%c in ('chcp') do set "CP=%%c"
+if "%CP%"=="936" set "PYTHONIOENCODING=gbk"
+if "%CP%"=="65001" set "PYTHONIOENCODING=utf-8"
+rem 重启 T14s 风扇服务(需要管理员)
 cd /d "%~dp0"
 if "%FCS_ELEV%"=="1" goto run
 fltmc >nul 2>&1
