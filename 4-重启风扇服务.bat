@@ -8,8 +8,8 @@ set FCS_ELEV=1
 powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
 exit /b
 :run
-"%~dp0runtime\python.exe" "%~dp0src\fan_service_ctl.py" stop
+"%~dp0..\runtime\python.exe" "%~dp0src\fan_service_ctl.py" stop
 timeout /t 2 /nobreak >nul
-"%~dp0runtime\python.exe" "%~dp0src\fan_service_ctl.py" start
-"%~dp0runtime\python.exe" "%~dp0src\fan_service_ctl.py" status
+"%~dp0..\runtime\python.exe" "%~dp0src\fan_service_ctl.py" start
+"%~dp0..\runtime\python.exe" "%~dp0src\fan_service_ctl.py" status
 pause

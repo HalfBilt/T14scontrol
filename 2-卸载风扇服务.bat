@@ -8,5 +8,5 @@ set FCS_ELEV=1
 powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
 exit /b
 :run
-"%~dp0runtime\python.exe" "%~dp0src\fan_service_ctl.py" uninstall
+"%~dp0..\runtime\python.exe" "%~dp0src\fan_service_ctl.py" uninstall
 pause

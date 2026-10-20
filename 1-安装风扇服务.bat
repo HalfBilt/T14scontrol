@@ -12,19 +12,19 @@ echo Requesting administrator privileges...
 powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
 exit /b
 :run
-if exist "%~dp0runtime\python.exe" goto ctl
-if exist "%~dp0runtime.zip" (
+if exist "%~dp0..\runtime\python.exe" goto ctl
+if exist "%~dp0..\runtime.zip" (
   echo Expanding bundled Python runtime...
-  tar -xf "%~dp0runtime.zip" -C "%~dp0"
+  tar -xf "%~dp0..\runtime.zip" -C "%~dp0..\"
 )
-if exist "%~dp0runtime\python.exe" goto ctl
-echo [X] runtime not found (runtime.zip missing?)
+if exist "%~dp0..\runtime\python.exe" goto ctl
+echo [X] runtime not found - expecting ..\runtime\python.exe (shared runtime).
 pause
 exit /b 1
 :ctl
-"%~dp0runtime\python.exe" "%~dp0src\fan_service_ctl.py" install
+"%~dp0..\runtime\python.exe" "%~dp0src\fan_service_ctl.py" install
 echo.
-"%~dp0runtime\python.exe" "%~dp0src\fan_service_ctl.py" status
+"%~dp0..\runtime\python.exe" "%~dp0src\fan_service_ctl.py" status
 echo.
 echo 日志: %~dp0fan_service.log
 pause
