@@ -628,6 +628,38 @@ def autostart_enabled():
         return False
 
 
+def _task_settings_fix():
+    """把计划的电池两条限制改成 false.
+
+    schtasks /Create 一定写死 DisallowStartIfOnBatteries=true /
+    StopIfGoingOnBatteries=true —— 后果是**用电池开机时风扇工具根本不会启动**,
+    而笔记本恰恰最需要不插电时也有风扇控制。schtasks 命令行没有对应开关,
+    只能用 PowerShell 的 ScheduledTasks 模块改。
+    """
+    ps = ("$n='%s'; try{ $t=Get-ScheduledTask -TaskName $n -ErrorAction Stop;"
+          "  $t.Settings.DisallowStartIfOnBatteries=$false;"
+          "  $t.Settings.StopIfGoingOnBatteries=$false;"
+          "  $t.Settings.ExecutionTimeLimit='PT0S';"
+          "  Set-ScheduledTask -TaskName $n -Settings $t.Settings | Out-Null;"
+          "  exit 0 } catch { exit 1 }" % TASK_NAME)
+    try:
+        p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           capture_output=True, creationflags=0x08000000)
+        return p.returncode == 0
+    except Exception:
+        return False
+
+
+def _task_allows_battery():
+    """任务是否没被"电池就不跑"挡住; 查不到当没挡(不乱动)."""
+    rc, out = _schtasks(["/Query", "/TN", TASK_NAME, "/XML"])
+    if rc != 0:
+        return True
+    m = re.search(r"<DisallowStartIfOnBatteries>\s*(true|false)\s*</DisallowStartIfOnBatteries>",
+                  out, re.I)
+    return not (m and m.group(1).lower() == "true")
+
+
 def autostart_set(enable):
     """开启/关闭开机自启. 需要管理员权限 (程序本身已提权)."""
     if not EXE_FOR_TASK:
@@ -637,21 +669,31 @@ def autostart_set(enable):
                              "/TR", '"%s"' % EXE_FOR_TASK,
                              "/SC", "ONLOGON", "/DELAY", "0000:15",
                              "/RL", "HIGHEST"])
-        return rc == 0, out
+        if rc != 0:
+            return False, out
+        ok2 = _task_settings_fix()
+        return True, out + ("" if ok2
+                            else " [警告] 电池设置没改成功: 用电池开机时不会自启")
     rc, out = _schtasks(["/Delete", "/TN", TASK_NAME, "/F"])
     return rc == 0, out
 
 
 def autostart_autofix(ctrl):
-    """自启任务存在但指向旧路径 (如程序搬家前) 时, 启动时自动修正."""
+    """启动时自查自启任务: 指向旧路径 / 被"电池不跑"挡住 就顺手修正."""
     if not EXE_FOR_TASK:
         return
     try:
         cmd = autostart_task_command()
-        if cmd is not None and not autostart_enabled():
+        if cmd is None:
+            return
+        if not autostart_enabled():
             ok, _ = autostart_set(True)
             ctrl.say("开机自启路径已修正 -> %s%s"
                      % (EXE_FOR_TASK, "" if ok else " (修正失败)"))
+        elif not _task_allows_battery():
+            ok = _task_settings_fix()
+            ctrl.say("开机自启已解除电池限制%s"
+                     % ("" if ok else " (失败, 需管理员)"))
     except Exception:
         pass
 
