@@ -104,21 +104,34 @@ DEFAULT_CONFIG = {
     #   DTS 就是核心温度, 升载瞬时比 EC 高 6~13°C; 减 6 后与 EC 同刻度,
     #   既保留原来按 EC 标定的曲线, 又能在急升时提前 5~8 秒升档。
     "dts_lead_c": 6.0,
+    "dts_use_min_w": 25.0,  # ★DTS 只在封装功耗 >= 该值时才参与曲线(轻载单核尖峰不算热)
+    #   ★2026-10-20: 实测 PKG=19W / EC=67°C 时 DTS 能到 85, 减 lead 后 79 -> 判 7 档,
+    #   听感是"没干活风扇却在提速"。功耗低于该值就只用 EC 定档; 0=不做这道门。
+    #   硬阈值 dts_max_c(>=88 拉满) 不受这道门影响, 仍随时生效。
     # ---- 功耗前馈 (RAPL: MSR 0x611/0x606, 最直接的"发热量") ----
-    "pkg_boost_w": 45.0,     # 封装功耗 >= 该值
-    "pkg_boost_s": 3.0,      #   持续该秒数 -> 拉满 (实测 54W 只需 2 秒就冲起来)
-    "pkg_release_w": 35.0,   # 回落到该值以下
+    "pkg_boost_w": 50.0,     # 封装功耗 >= 该值
+    "pkg_boost_s": 4.0,      #   持续该秒数 -> 抬到 pkg_boost_level
+    "pkg_boost_level": 7,    #   ★前馈目标档位(默认 7=3858); 满速只留给真温度
+    #   ★2026-10-20 优化: 原来 45W/3 秒直接跳满速 0x40(4807) —— 45W 在 1360P 上很常见
+    #   (开网页/解压/VS Code 索引), 一跳就是满速再叠加 60 秒驻留, 用户听感是
+    #   "什么都没干风扇狂转一分钟"。现在: 前馈只抬到 7 档, 满速交给曲线>=80°C /
+    #   DTS>=dts_max / EC>=failsafe 这些**真温度**条件; 阈值也提到 50W/4 秒。
+    "pkg_release_w": 38.0,   # 回落到该值以下
     "pkg_release_s": 10.0,   #   持续该秒数才解除
     # ---- 负载前馈 (GetSystemTimes, 免驱动) ----
     "load_boost_pct": 70.0,  # 占用 >= 该值
-    "load_boost_s": 5.0,     #   持续该秒数 -> 拉满 (原 10 秒, 实测太慢)
-    "load_boost_level": 64,  #   前馈目标档位 (0=关闭前馈)
+    "load_boost_s": 5.0,     #   持续该秒数 -> 抬到 load_boost_level
+    "load_boost_level": 7,   #   前馈目标档位 (0=关闭前馈); ★64->7: 同上, 别一跳满速
     "load_release_pct": 55.0,   # 占用回落到该值以下
     "load_release_s": 10.0,     #   持续该秒数才解除前馈
     # ---- 降档保护 ----
     "dwell_s": 60,           # 换档后 N 秒内不降档(防边界横跳); 0=不限制
     #   ★25 -> 60: 实测日志里档位每 20~90 秒就跳一次(0x02<->0x03<->0x06),
     #   风扇会一直"呜——呜——"地换挡。降档驻留拉长到 60 秒, 升档仍然立即。
+    #   ★2026-10-20 补温度条件(dwell_hold): 驻留只在"温度仍在当前档触发点
+    #   dwell_temp_margin 以内"时才压住; 掉得够远立刻降档。否则一次 3 秒尖峰
+    #   拉起档位后, 温度早回 50°C 了还要白吹 60 秒。
+    "dwell_temp_margin": 10.0,   # 驻留判据的温度余量(°C); 0=退回"无条件驻留"
     # 满速档的退出温度(进 84 / 退 78): 28W 满载时 7 档压不住, 不设这个值就会
     # 每 25 秒"满速<->7 档"锯齿一次(见 decide_level 注释); 0=关闭, 退化成普通滞回
     "max_exit_c": 74.0,
@@ -136,7 +149,16 @@ DEFAULT_CONFIG = {
     #   62~72°C-> 6档(3456)  : 中载; 3/4/5 档(3181/3186/3167) 转速几乎相同, 直接跳过
     #   72~80°C-> 7档(3858)  : 84°C 拉满之前的缓冲档
     #   ≥84°C  -> 满速(4807)  : 0x40 要 20~25 秒才到位, 所以阈值必须靠前
-    "curve": [[50, 1], [62, 2], [72, 6], [80, 7], [84, 64]],
+    "curve": [[50, 1], [56, 6], [72, 7], [80, 64]],
+    #   ★2026-10-20 调整(恢复 56°C 以上的降温强度)。语义是 **temp >= t 才升到该档**,
+    #   低于第一个点时用 curve[0] 的档位, 所以每段覆盖 [t_i, t_{i+1}):
+    #     <56      -> 1 档(2471)   低温静音
+    #     56~72    -> 6 档(3456)   ★恢复拆分前的强度(旧版 56~79 就是 6 档)
+    #     72~80    -> 7 档(3858)   比旧版更强(旧版这段还是 6 档)
+    #     >=80     -> 满速(4807)   与旧版 >=79 满速一致
+    #   旧的那条 [[50,1],[62,2],[72,6],[80,7],[84,64]] 实际是:
+    #     <62 -> 1 档、62~72 -> 2 档、72~80 -> 6 档、>=84 才满速 —— 50~72 这段比拆分前
+    #     弱得多(那时 56 以上就是 6 档), 就是"退步"的来源。
 }
 
 
@@ -380,6 +402,33 @@ def blend_temp(ec, dts, lead):
     return max(ec, dts - lead)
 
 
+def dwell_hold(temp, curve, level, max_exit, margin):
+    """降档驻留期内, 还要不要为了"别抖"而压住不降?
+
+    ★2026-10-20: 原来的驻留是**无条件**的 —— 换档后 60 秒内一律不降档。于是一次 3 秒的
+    功耗/负载尖峰把档位拉上去, 哪怕温度已经掉回 50°C, 也要白吹满 60 秒(用户听感就是
+    "风扇突然狂转一分钟")。旧版单进程时代其实有温度条件(temp > 触发点-10), 拆分时漏了。
+
+    现在的判据: 温度**仍在当前档触发点 margin 以内**才压住; 掉得够远就立刻降。
+      · 普通档: 触发点 = 曲线里这一档的温度(如 6 档 = 72°C)
+      · 满速档: 触发点取 max_exit(默认 74°C, 本身就是"低画"的退出点)
+    temp 为 None(读不到)时保守压住, 不冒险降。
+    """
+    if temp is None:
+        return True
+    trig = None
+    if max_exit is not None and curve and level == curve[-1][1]:
+        trig = max_exit
+    else:
+        for t, lv in curve:
+            if lv == level:
+                trig = t
+                break
+    if trig is None:
+        return True                     # 找不到触发点(如 0x80/0x00)就别乱降
+    return temp > trig - margin
+
+
 def decide_level(temp, curve, current, hysteresis, max_exit=None):
     """curve: [[temp, hfsp], ...] 按温度升序. 返回目标 HFSP 值.
     升档立即; 降档需温度低于当前档触发点 - hysteresis (防抖动).
@@ -455,7 +504,7 @@ class FanController(object):
         #   托盘已删, 没人改配置了, 所以这里把 config 同步成当前默认(只补齐缺的/过时的键)。
         if self._sync_config_to_defaults():
             self.cfg.update({k: v for k, v in DEFAULT_CONFIG.items()
-                              if k in ("mode", "curve", "hysteresis", "dts_max_c",
+                              if k in ("mode", "hysteresis", "dts_max_c",
                                        "dwell_s", "max_exit_c", "cycle_sec", "tick_sec",
                                        "backend")})
         if self.mode not in ("smart", "manual", "max", "auto"):
@@ -468,6 +517,7 @@ class FanController(object):
         # DTS / 负载前馈 状态
         self.msr = None                 # MSRThermal 实例(可缺席)
         self.last_dts = None            # DTS 温度 °C
+        self._dts_prev = None           # 上一拍的 DTS(滤单拍尖峰用)
         self.last_load = None           # 系统占用 %
         self.last_pkg = None            # 封装功耗 W
         self.ff = LoadFeedforward()     # 负载前馈
@@ -723,16 +773,19 @@ class FanController(object):
         fs_temp = int(self.cfg.get("failsafe_temp", 88))
         dts_max = float(self.cfg.get("dts_max_c", 92.0) or 0)
         dts_lead = float(self.cfg.get("dts_lead_c", 6.0) or 0)
+        dts_use_w = float(self.cfg.get("dts_use_min_w", 25.0) or 0)
         pkg_on = float(self.cfg.get("pkg_boost_w", 45.0) or 0)
         pkg_on_s = float(self.cfg.get("pkg_boost_s", 3.0))
         pkg_off = float(self.cfg.get("pkg_release_w", 35.0))
         pkg_off_s = float(self.cfg.get("pkg_release_s", 10.0))
         boost_pct = float(self.cfg.get("load_boost_pct", 70.0))
         boost_s = float(self.cfg.get("load_boost_s", 5.0))
-        boost_lv = int(self.cfg.get("load_boost_level", 64) or 0)
+        boost_lv = int(self.cfg.get("load_boost_level", 7) or 0)
+        pkg_lv = int(self.cfg.get("pkg_boost_level", 7) or 0)
         rel_pct = float(self.cfg.get("load_release_pct", 55.0))
         rel_s = float(self.cfg.get("load_release_s", 10.0))
         dwell = float(self.cfg.get("dwell_s", 25) or 0)
+        dwell_margin = float(self.cfg.get("dwell_temp_margin", 10.0) or 0.0)
         max_exit = float(self.cfg.get("max_exit_c", 78.0) or 0)
         curve = [[int(t), int(v)] for t, v in self.cfg.get("curve", DEFAULT_CONFIG["curve"])]
         curve.sort(key=lambda x: x[0])
@@ -741,10 +794,11 @@ class FanController(object):
                  % (tick, cycle, dts_lead))
         self.say("快速通道: DTS %s | 功耗 %s | 负载 %s" % (
             (">=%g°C 拉满" % dts_max) if (dts_max > 0 and self.msr) else "关闭",
-            (">=%gW 持续 %gs 拉满" % (pkg_on, pkg_on_s)) if (pkg_on and self.msr) else "关闭",
-            ("占用>=%g%% 持续 %gs 拉满" % (boost_pct, boost_s)) if boost_lv else "关闭"))
-        self.say("降档: 驻留 %gs | 满速档退到 %s"
-                 % (dwell, ("%g°C 才退" % max_exit) if max_exit > 0 else "普通滞回"))
+            (">=%gW 持续 %gs -> %d 档" % (pkg_on, pkg_on_s, pkg_lv))
+            if (pkg_on and self.msr) else "关闭",
+            ("占用>=%g%% 持续 %gs -> %d 档" % (boost_pct, boost_s, boost_lv)) if boost_lv else "关闭"))
+        self.say("降档: 驻留 %gs(仅当温度仍在触发点 %g°C 内) | 满速档退到 %g°C 才退"
+                 % (dwell, dwell_margin, max_exit))
         # ★2026-10-20: 启动/唤醒后**立刻**写一次档位。
         #   实测固件每 ~30 秒按自己的曲线重写 0x2F, 温度 60~63°C 时它会选 0x01(2471 RPM)
         #   —— 服务没在的时候就是这个状态(用户报的"风扇几乎不转")。
@@ -811,7 +865,21 @@ class FanController(object):
             # ★曲线输入: DTS 是核心温度, 急升时比 EC 高 6~13°C。减 dts_lead 拉回
             #   与 EC 同刻度后取两者较大值 —— 稳态时 EC 说了算(不会一直偏吵),
             #   冲载时 DTS 提前 5~8 秒把档位顶上去。
-            t_ctrl = blend_temp(temp, dts, dts_lead)
+            # ★2026-10-20 优化: DTS 是"最热核", 凉机时单核睿频也能冲到 86°C -> 86-6=80
+            #   -> 曲线直接判满速, 这就是"什么都没干风扇也拉满"的一个来源。取连续两拍
+            #   的**较小值**(2 秒一拍 = 4 秒窗口): 单拍尖峰被滤掉, 真升温(连续高)照样通过,
+            #   代价只是最多延后 2 秒 —— 与 CPU 侧 DTS 快通道"连高两拍"同一套哲学。
+            dts_f = dts
+            if dts is not None and self._dts_prev is not None:
+                dts_f = min(dts, self._dts_prev)
+            self._dts_prev = dts
+            # ★2026-10-20 优化(第二道): 轻载时 DTS 的**单核睿频尖峰**不代表整体发热 ——
+            #   实测 PKG 只有 19W、EC 67°C 时 DTS 能到 85, 减 6 就是 79 -> 曲线判 7 档,
+            #   用户听感是"没干活风扇却在提速"。所以只在封装功耗真的有量时才让 DTS 参与;
+            #   功耗读不到(None)时保守照用(宁可多吹)。硬阈值 dts_max_c 那条不受影响。
+            if dts_use_w > 0 and pkg is not None and pkg < dts_use_w:
+                dts_f = None
+            t_ctrl = blend_temp(temp, dts_f, dts_lead)
 
             with self.lock:
                 self.last_temp, self.last_rpm = temp, rpm
@@ -846,18 +914,26 @@ class FanController(object):
                         target, reason = 64, "DTS %s°C" % (dts if dts is not None else "--")
                     elif bit_hot:
                         target, reason = 64, "固件热状态位"
-                    elif ff_pkg and boost_lv:
-                        # ★2026-10-20: 前馈只能"把档位往上抬", 绝不能把曲线算出的
-                        #   更高档位压下来(原来这里是赋值 target = boost_lv)。
-                        #   例子: 曲线因 EC 到了 78°C 要 7 档, 但负载前馈刚解除 ->
-                        #   原来会把它改回 boost_lv(满速)或更低, 造成"越热档位越小"。
-                        if boost_lv > target:
-                            target, reason = boost_lv, "功耗 %.0fW" % (pkg or 0)
+                    elif ff_pkg and pkg_lv:
+                        # ★2026-10-20 优化: 功耗前馈不再直接跳满速。45W 持续 3 秒在 1360P 上
+                        #   很常见(开网页/解压/VS Code 索引), 以前一跳就是 0x40(4807 RPM),
+                        #   再叠加 60 秒驻留 -> "什么都没干风扇狂转一分钟"。
+                        #   现在只抬到 pkg_boost_level(默认 7 档 3858); 真要满速交给温度
+                        #   (曲线 >=80°C / DTS>=dts_max / EC>=failsafe), 那才是真热。
+                        if pkg_lv > target:
+                            target, reason = pkg_lv, "功耗 %.0fW" % (pkg or 0)
                     elif ff and boost_lv:
                         if boost_lv > target:
                             target, reason = boost_lv, "负载 %.0f%%" % (load or 0)
                     elif (self.current_hfsp in LEVEL_RPM and target < self.current_hfsp
-                          and dwell > 0 and (now - self._last_change) < dwell):
+                          and dwell > 0 and (now - self._last_change) < dwell
+                          and dwell_hold(t_ctrl, curve, self.current_hfsp,
+                                         max_exit or None, dwell_margin)):
+                        # ★2026-10-20 优化: 驻留原来是无条件的 —— 一次 3 秒尖峰拉起档位后,
+                        #   哪怕温度早就掉回 50°C 也要白吹满 60 秒。旧版其实有温度条件
+                        #   (temp > 触发点 - 10), 拆分时丢了。现在恢复并做成可调:
+                        #   只有温度**仍在当前档触发点 dwell_temp_margin 以内**才驻留;
+                        #   掉得够远就立刻降档。
                         target = self.current_hfsp      # 驻留期内不降档
                     if target != self.current_hfsp:
                         self._write_level(target, now)
@@ -977,19 +1053,19 @@ def selftest():
     check("最低档是 0x01 不是停转", decide_level(30, curve, 1, 4), 1)
     check("49C -> 1 档", decide_level(49, curve, 1, 4), 1)
     check("50C -> 1 档", decide_level(50, curve, 1, 4), 1)
-    check("62C -> 2 档", decide_level(62, curve, 1, 4), 2)
-    check("72C -> 6 档(跳过没意义的 3/4/5)", decide_level(72, curve, 2, 4), 6)
-    check("80C -> 7 档", decide_level(80, curve, 6, 4), 7)
+    check("62C -> 6 档(56 起就是 6 档)", decide_level(62, curve, 1, 4), 6)
+    check("72C -> 7 档(跳过没意义的 3/4/5)", decide_level(72, curve, 2, 4), 7)
+    check("80C -> 满速", decide_level(80, curve, 6, 4), 64)
     check("84C -> 满速", decide_level(84, curve, 7, 4), 64)
     check("滞回: 81C 仍满速", decide_level(81, curve, 64, 4), 64)
     # 满速档的回差基准是它自己的触发点 84°C: 80C >= 84-4 -> 仍保持满速
     check("滞回: 80C 仍满速(回差基准=满速触发点 84)", decide_level(80, curve, 64, 4), 64)
     check("满速退出: 75C 仍满速(退 74)", decide_level(75, curve, 64, 4, 74.0), 64)
     check("满速退出: 74C 踩线仍满速", decide_level(74, curve, 64, 4, 74.0), 64)
-    check("满速退出: 73C 才退", decide_level(73, curve, 64, 4, 74.0), 6)
+    check("满速退出: 73C 才退(退到 7 档)", decide_level(73, curve, 64, 4, 74.0), 7)
     # 满速档的触发点是 84 -> 回差 4 -> 80C 才退到曲线档(6 档); 79C 就已经退了
-    check("满速退出: 关掉 max_exit 就按普通滞回(79C 退到 6 档)", decide_level(79, curve, 64, 4, None), 6)
-    check("非满速档不受 max_exit 影响(73C 退到 6 档)", decide_level(73, curve, 7, 4, 74.0), 6)
+    check("满速退出: 关掉 max_exit 就按普通滞回(79C 仍满速)", decide_level(79, curve, 64, 4, None), 64)
+    check("非满速档不受 max_exit 影响(73C 仍是 7 档)", decide_level(73, curve, 7, 4, 74.0), 7)
 
     print("== 2. 负载前馈状态机 (示例参数 70% / 10s 进, 55% / 10s 出) ==")
     ff = LoadFeedforward()
@@ -1024,10 +1100,22 @@ def selftest():
     check("高温: EC 86 / DTS 91 -> 86", blend_temp(86, 91, 6), 86)
     check("无 DTS: 退回 EC", blend_temp(70, None, 6), 70)
     check("无 EC: 用 DTS-lead", blend_temp(None, 80, 6), 74)
-    check("实际效果 73/86 进 7 档",
-          decide_level(blend_temp(73, 86, 6), curve, 6, 4), 7)
-    check("实际效果 70/76 仍是 2 档",
-          decide_level(blend_temp(70, 76, 6), curve, 2, 4), 2)
+    check("实际效果 73/86 拉满(blend=80)",
+          decide_level(blend_temp(73, 86, 6), curve, 6, 4), 64)
+    check("实际效果 70/76 进 6 档",
+          decide_level(blend_temp(70, 76, 6), curve, 2, 4), 6)
+
+    print("== 4b. 降档驻留的温度条件 (dwell_hold, margin=10) ==")
+    # 6 档的触发点 = 56°C -> 温度 > 46 才压住
+    check("6 档/60°C 仍在余量内 -> 压住", dwell_hold(60, curve, 6, 74.0, 10), True)
+    check("6 档/50°C 仍在余量内 -> 压住", dwell_hold(50, curve, 6, 74.0, 10), True)
+    check("6 档/47°C 临界(>46)", dwell_hold(47, curve, 6, 74.0, 10), True)
+    check("6 档/45°C 越界", dwell_hold(45, curve, 6, 74.0, 10), False)
+    # 满速档用 max_exit(74) 当基准 -> 温度 > 64 才压住
+    check("满速/70°C 压住", dwell_hold(70, curve, 64, 74.0, 10), True)
+    check("满速/60°C 降", dwell_hold(60, curve, 64, 74.0, 10), False)
+    check("温度读不到 -> 保守压住", dwell_hold(None, curve, 6, 74.0, 10), True)
+    check("未知档位 -> 不乱降", dwell_hold(80, curve, 0x80, 74.0, 10), True)
 
     print("== 5. EC 温度哨兵 ==")
     check("正常 25°C", ec_temp_ok(25), True)
