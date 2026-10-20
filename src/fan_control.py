@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 FanControl -- ThinkPad T14s Gen 4 智能风扇控制 (PawnIO 双模块)
@@ -165,7 +165,7 @@ class PawnIO(object):
 
         self.mutex = (ctypes.windll.kernel32.CreateMutexW(None, False, u"Global\\Access_EC")
                       if label == "LpcACPIEC" else None)
-        self.busy_skips = 0
+        self._busy_since = 0.0
 
     def _lock(self):
         if not self.mutex:
@@ -228,13 +228,16 @@ class PawnIO(object):
         """
         st = self.pio_read(CTRL_PORT)
         if st & (FLAG_IBF | FLAG_OBF):
-            self.busy_skips += 1
-            if self.busy_skips < 5:
+            # 挂了 2 秒还没人取走 -> 只能是我们自己上次失败留下的残余; 否则就让开
+            if self._busy_since and time.time() - self._busy_since > 2.0:
+                self._drain()
+                self._busy_since = 0.0
+            else:
+                if not self._busy_since:
+                    self._busy_since = time.time()
                 return False
-            self._drain()                       # 只可能是我们自己留下的
-            self.busy_skips = 0
         else:
-            self.busy_skips = 0
+            self._busy_since = 0.0
         if not self._wait(0, FLAG_IBF | FLAG_OBF, timeout_ms=50):
             return False
         # 再确认一次: 刚看到空闲, 对方可能正好在这 1~2 ms 里开始写
