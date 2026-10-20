@@ -57,6 +57,11 @@ DT_VCENTER = 0x0004
 DT_SINGLELINE = 0x0020
 DT_NOPREFIX = 0x0800
 
+NIF_INFO = 0x10
+NIIF_WARNING = 0x02
+GWL_EXSTYLE = -20
+WS_EX_TRANSPARENT = 0x00000020
+
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
@@ -105,6 +110,7 @@ DEFAULT_CFG = {
     'scale': 1.0,
     'theme': 'auto',
     'pill': True,
+    'locked': False,
     'offset_right': 470,
 }
 
@@ -229,6 +235,11 @@ def _proto():
     user32.CreateIconIndirect.argtypes = [P(ICONINFO)]
     user32.CreateIconIndirect.restype = w.HICON
     user32.GetCursorPos.argtypes = [P(w.POINT)]
+    user32.SetForegroundWindow.argtypes = [w.HWND]
+    user32.GetWindowLongW.argtypes = [w.HWND, ctypes.c_int]
+    user32.GetWindowLongW.restype = ctypes.c_long
+    user32.SetWindowLongW.argtypes = [w.HWND, ctypes.c_int, ctypes.c_long]
+    user32.SetWindowLongW.restype = ctypes.c_long
     user32.SetCapture.argtypes = [w.HWND]
     user32.SetCapture.restype = w.HWND
     user32.SetTimer.argtypes = [w.HWND, ctypes.c_size_t, w.UINT, w.LPVOID]
@@ -344,9 +355,10 @@ def collect(cfg):
             v = cpu.get('freq_mhz')
             segs.append(('%.1fG' % (v / 1000.0) if v else '--G', 'fg' if v else 'dim'))
         elif f in ('temp', 'dts'):
-            t = cpu.get('ec') if f == 'temp' else cpu.get('dts')
+            # EC 温度优先用风扇服务(5 秒一读)；CPU 服务的 EC 缓存是 15 秒一读, 会滞后
+            t = fan.get('ec') if f == 'temp' else cpu.get('dts')
             if t is None:
-                t = fan.get('ec') if f == 'temp' else fan.get('dts')
+                t = cpu.get('ec') if f == 'temp' else fan.get('dts')
             if t is None:
                 segs.append(('--\u00b0', 'dim'))
             else:
@@ -409,6 +421,7 @@ class Hud(object):
         self.icon = None
         self.icon_col = None
         self.hover = False
+        self._alert = {}          # {'cpu': 上次提醒时间, 'fan': ...}
         self.visible = bool(cfg.get('enabled', True))
         self.auto_pos = cfg.get('x') is None
         self.wndproc_ref = WNDPROC(self._wndproc)
@@ -518,6 +531,7 @@ class Hud(object):
             raise OSError('CreateWindowExW 失败: %d' % ctypes.get_last_error())
         user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE if self.visible else SW_HIDE)
         user32.SetTimer(self.hwnd, 1, 1000, None)
+        self.apply_lock()
         self.tray_add()
         self.refresh()
 
@@ -761,6 +775,43 @@ class Hud(object):
         self.nid.szTip = ('%s  %s' % (APP_NAME, txt))[:120]
         shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self.nid))
 
+    def apply_lock(self):
+        """锁定位置 = 加 WS_EX_TRANSPARENT，鼠标点击穿过（就不会挡住任务栏图标）。"""
+        ex = user32.GetWindowLongW(self.hwnd, GWL_EXSTYLE)
+        if self.cfg.get('locked'):
+            ex |= WS_EX_TRANSPARENT
+        else:
+            ex &= ~WS_EX_TRANSPARENT
+        user32.SetWindowLongW(self.hwnd, GWL_EXSTYLE, ex)
+
+    def notify(self, title, text):
+        """托盘气泡提醒。"""
+        if not self.nid:
+            return
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(nid)
+        nid.hWnd = self.hwnd
+        nid.uID = 1
+        nid.uFlags = NIF_INFO
+        nid.szInfoTitle = title[:63]
+        nid.szInfo = text[:255]
+        nid.dwInfoFlags = NIIF_WARNING
+        nid.uVersion = 10000          # 这个位置在 NIF_INFO 下是超时(毫秒)
+        shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+
+    def check_alerts(self):
+        """服务掉线超过 60 秒提醒一次（同一来源 10 分钟内不重复）。"""
+        now = time.time()
+        for key, fname, label in (('cpu', 'cpu.json', 'CPU 服务'), ('fan', 'fan.json', '风扇服务')):
+            d = _json(os.path.join(STATUS_DIR, fname))
+            age = now - float((d or {}).get('ts') or 0)
+            if age > 60:
+                last = self._alert.get(key, 0)
+                if now - last > 600:
+                    self._alert[key] = now
+                    self.notify('T14scontrol', '%s 已 %d 秒没有更新，功耗墙/风扇可能没在接管。'
+                                % (label, int(age)))
+
     def set_visible(self, on):
         self.visible = bool(on)
         self.cfg['enabled'] = self.visible
@@ -794,6 +845,8 @@ class Hud(object):
                                510 + i, '外观: ' + label)
         user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if self.cfg.get('pill', True) else 0),
                            520, '底框')
+        user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if self.cfg.get('locked') else 0),
+                           521, '锁定位置（点击穿过）')
         user32.AppendMenuW(hm, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if is_autostart() else 0), 300, '开机自启')
         user32.AppendMenuW(hm, MF_STRING, 301, '恢复默认位置')
@@ -843,6 +896,10 @@ class Hud(object):
             self.cfg['pill'] = not self.cfg.get('pill', True)
             save_cfg(self.cfg)
             self.refresh()
+        elif cmd == 521:
+            self.cfg['locked'] = not self.cfg.get('locked')
+            save_cfg(self.cfg)
+            self.apply_lock()
         elif cmd == 300:
             set_autostart(not is_autostart())
         elif cmd == 301:
@@ -861,6 +918,7 @@ class Hud(object):
                 if self.visible:
                     self.refresh()
                 self.tray_tip()
+                self.check_alerts()
                 return 0
             if msg == WM_TRAY:
                 ev = lparam & 0xFFFF
