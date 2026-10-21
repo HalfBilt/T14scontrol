@@ -39,6 +39,7 @@ WM_MOUSEMOVE = 0x0200
 WM_RBUTTONUP = 0x0205
 WM_LBUTTONDBLCLK = 0x0203
 WM_MOUSELEAVE = 0x02A3
+WM_TOGGLE = WM_APP + 2
 
 WS_POPUP = 0x80000000
 WS_EX_TOPMOST = 0x00000008
@@ -297,6 +298,17 @@ def _proto():
     kernel32.CreateMutexW.argtypes = [w.LPVOID, w.BOOL, w.LPCWSTR]
     kernel32.CreateMutexW.restype = w.HANDLE
     kernel32.SetLastError.argtypes = [w.DWORD]
+    kernel32.CreateEventW.argtypes = [w.LPVOID, w.BOOL, w.BOOL, w.LPCWSTR]
+    kernel32.CreateEventW.restype = w.HANDLE
+    kernel32.OpenEventW.argtypes = [w.DWORD, w.BOOL, w.LPCWSTR]
+    kernel32.OpenEventW.restype = w.HANDLE
+    kernel32.OpenMutexW.argtypes = [w.DWORD, w.BOOL, w.LPCWSTR]
+    kernel32.OpenMutexW.restype = w.HANDLE
+    kernel32.SetEvent.argtypes = [w.HANDLE]
+    kernel32.ResetEvent.argtypes = [w.HANDLE]
+    kernel32.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
+    kernel32.WaitForSingleObject.restype = w.DWORD
+    user32.PostMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
     kernel32.GlobalMemoryStatusEx.argtypes = [P(MEMORYSTATUSEX)]
     kernel32.GetSystemPowerStatus.argtypes = [P(SYSTEM_POWER_STATUS)]
     kernel32.GetSystemTimes.argtypes = [P(FILETIME)] * 3
@@ -661,7 +673,7 @@ class Hud(object):
         user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE if self.visible else SW_HIDE)
         user32.SetTimer(self.hwnd, 1, 1000, None)
         self.apply_lock()
-        self.tray_add()
+        self.start_toggle_thread()
         self.refresh()
 
     # ---- 合成 + 上屏
@@ -921,6 +933,32 @@ class Hud(object):
         self.nid.szTip = ('%s  %s' % (APP_NAME, txt))[:120]
         shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self.nid))
 
+    def _dbg(self, msg):
+        try:
+            with open(os.path.join(BASE, 'toggle.log'), 'a', encoding='utf-8') as fh:
+                fh.write('%s %s' % (time.strftime('%H:%M:%S'), msg) + chr(10))
+        except Exception:
+            pass
+
+    def start_toggle_thread(self):
+        """监听命名事件：另一个进程(bat)发信号 -> 显示/隐藏切换。"""
+        import threading
+        kernel32.CreateEventW(None, True, False, TOGGLE_EVT)
+        evt = kernel32.OpenEventW(0x00100002, False, TOGGLE_EVT)   # SYNCHRONIZE|EVENT_MODIFY_STATE
+
+        if not evt:
+            return
+
+        def waiter():
+            while True:
+                if kernel32.WaitForSingleObject(evt, 500) == 0:
+                    kernel32.ResetEvent(evt)
+                    if kernel32.WaitForSingleObject(evt, 0) == 0:
+                        kernel32.ResetEvent(evt)
+                    user32.PostMessageW(self.hwnd, WM_TOGGLE, 0, 0)
+        threading.Thread(target=waiter, daemon=True).start()
+        self._dbg('toggle thread started, evt=%s' % evt)
+
     def apply_lock(self):
         """锁定位置 = 加 WS_EX_TRANSPARENT，鼠标点击穿过（就不会挡住任务栏图标）。"""
         ex = user32.GetWindowLongW(self.hwnd, GWL_EXSTYLE)
@@ -981,7 +1019,7 @@ class Hud(object):
     # ---- 菜单
     def menu(self):
         hm = user32.CreatePopupMenu()
-        user32.AppendMenuW(hm, MF_STRING, 100, '隐藏' if self.visible else '显示')
+        user32.AppendMenuW(hm, MF_STRING, 100, '隐藏（用 5-开.bat 再显示）' if self.visible else '显示')
         user32.AppendMenuW(hm, MF_SEPARATOR, 0, None)
         cur = set(self.cfg['fields'])
         for i, (key, label) in enumerate(FIELDS):
@@ -1079,8 +1117,10 @@ class Hud(object):
             if msg == WM_TIMER:
                 if self.visible:
                     self.refresh()
-                self.tray_tip()
-                self.check_alerts()
+                return 0
+            if msg == WM_TOGGLE:
+                self._dbg('WM_TOGGLE -> %s' % (not self.visible))
+                self.set_visible(not self.visible)
                 return 0
             if msg == WM_TRAY:
                 ev = lparam & 0xFFFF
@@ -1146,6 +1186,7 @@ class Hud(object):
 # ---------------------------------------------------------------- 自启
 RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
 RUN_NAME = 'T14scontrolHUD'
+TOGGLE_EVT = 'Global\\T14scontrolHUD_toggle'
 
 
 def pythonw():
@@ -1206,6 +1247,15 @@ def main():
             user32.SetProcessDPIAware()
         except Exception:
             pass
+
+    if '--toggle' in sys.argv:
+        # 已经有一个在跑 -> 通知它切换显示/隐藏；没跑 -> 继续往下正常启动
+        m = kernel32.OpenMutexW(0x00100000, False, 'Global\\' + APP_NAME + '_mutex')
+        if m:
+            evt = kernel32.OpenEventW(0x0002, False, TOGGLE_EVT)   # EVENT_SET_STATE
+            if evt:
+                kernel32.SetEvent(evt)
+            return 0
 
     kernel32.SetLastError(0)
     kernel32.CreateMutexW(None, False, 'Global\\' + APP_NAME + '_mutex')
