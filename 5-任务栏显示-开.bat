@@ -1,13 +1,17 @@
 @echo off
-rem ---- console codepage adaptive: keep Python output readable ----
-for /f "tokens=2 delims=: " %%c in ('chcp') do set "CP=%%c"
-if "%CP%"=="936" set "PYTHONIOENCODING=gbk"
-if "%CP%"=="65001" set "PYTHONIOENCODING=utf-8"
 setlocal
 cd /d "%~dp0"
+
 set "PYW=%~dp0..\runtime\pythonw.exe"
-if not exist "%PYW%" set "PYW=pythonw.exe"
-start "" "%PYW%" "%~dp0hud\hud.py"
-echo 任务栏显示已启动（若已在运行则不会重复开）。
-echo 右键点任务栏上的小方块，可切换显示项、开机自启、隐藏/退出。
-timeout /t 2 >nul
+if not exist "%PYW%" (
+    echo [错误] 找不到共用运行时: %PYW%
+    echo 请确认 T14scontrol\runtime\pythonw.exe 还在。
+    pause
+    exit /b 1
+)
+
+start "" "%PYW%" "%~dp0hud.py"
+echo 任务栏显示已启动（已在运行则不会重复开）。
+echo 右键点任务栏上的读数块调菜单；也可右键托盘里的三叶风扇图标。
+echo 注意：直接双击 hud.py 会报错（.py 没有文件关联），请用本 bat。
+timeout /t 3 >nul

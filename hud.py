@@ -24,6 +24,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 
 APP_NAME = 'T14scontrolHUD'
@@ -67,6 +68,11 @@ SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+
 TPM_RETURNCMD = 0x0100
 TPM_RIGHTBUTTON = 0x0002
 MF_STRING = 0x0000
@@ -88,6 +94,7 @@ CFG_PATH = os.path.join(BASE, 'hud.json')
 
 FIELDS = [
     ('freq', 'CPU 频率'),
+    ('cpu', 'CPU 占用'),
     ('temp', 'EC 温度'),
     ('dts', 'DTS 温度'),
     ('fan', '风扇转速'),
@@ -104,12 +111,13 @@ SCALES = [('小', 0.80), ('标准', 1.0), ('大', 1.18), ('特大', 1.38)]
 
 DEFAULT_CFG = {
     'enabled': True,
-    'fields': ['freq', 'temp', 'fan'],
+    'fields': ['freq', 'cpu', 'temp', 'fan'],
     'x': None,
     'y': None,
     'scale': 1.0,
     'theme': 'auto',
     'pill': True,
+    'labels': 'short',
     'locked': False,
     'offset_right': 470,
 }
@@ -119,11 +127,13 @@ PALETTE = {
     'dark': {
         'pill': (44, 44, 47, 205), 'line': (90, 90, 96, 70),
         'fg': (234, 234, 236), 'dim': (156, 156, 162), 'sep': (108, 108, 114),
+        'label': (136, 136, 142),
         'hot': [(60, (134, 201, 143)), (80, (92, 182, 224)), (999, (107, 116, 232))],
     },
     'light': {
         'pill': (250, 250, 252, 225), 'line': (120, 120, 128, 60),
         'fg': (27, 27, 30), 'dim': (91, 91, 96), 'sep': (150, 150, 156),
+        'label': (118, 118, 124),
         'hot': [(60, (67, 158, 88)), (80, (23, 127, 196)), (999, (62, 62, 216))],
     },
 }
@@ -133,6 +143,9 @@ user32 = ctypes.WinDLL('user32', use_last_error=True)
 gdi32 = ctypes.WinDLL('gdi32', use_last_error=True)
 shell32 = ctypes.WinDLL('shell32', use_last_error=True)
 kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+kernel32.GetCurrentProcess.restype = w.HANDLE
+kernel32.SetPriorityClass.argtypes = [w.HANDLE, w.DWORD]
+kernel32.SetPriorityClass.restype = w.BOOL
 
 LRESULT = ctypes.c_longlong
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, w.HWND, w.UINT, w.WPARAM, w.LPARAM)
@@ -178,6 +191,10 @@ class SYSTEM_POWER_STATUS(ctypes.Structure):
     _fields_ = [('ACLineStatus', ctypes.c_byte), ('BatteryFlag', ctypes.c_byte),
                 ('BatteryLifePercent', ctypes.c_byte), ('SystemStatusFlag', ctypes.c_byte),
                 ('BatteryLifeTime', w.DWORD), ('BatteryFullLifeTime', w.DWORD)]
+
+
+class FILETIME(ctypes.Structure):
+    _fields_ = [('dwLowDateTime', w.DWORD), ('dwHighDateTime', w.DWORD)]
 
 
 class ICONINFO(ctypes.Structure):
@@ -279,8 +296,11 @@ def _proto():
     kernel32.GetModuleHandleW.restype = w.HMODULE
     kernel32.CreateMutexW.argtypes = [w.LPVOID, w.BOOL, w.LPCWSTR]
     kernel32.CreateMutexW.restype = w.HANDLE
+    kernel32.SetLastError.argtypes = [w.DWORD]
     kernel32.GlobalMemoryStatusEx.argtypes = [P(MEMORYSTATUSEX)]
     kernel32.GetSystemPowerStatus.argtypes = [P(SYSTEM_POWER_STATUS)]
+    kernel32.GetSystemTimes.argtypes = [P(FILETIME)] * 3
+    kernel32.GetSystemTimes.restype = w.BOOL
 
 
 _proto()
@@ -300,6 +320,8 @@ def load_cfg():
         cfg['scale'] = min(1.5, max(0.7, float(cfg.get('scale') or 1.0)))
     except Exception:
         cfg['scale'] = 1.0
+    if cfg.get('labels') not in ('full', 'short', 'none'):
+        cfg['labels'] = 'short'
     return cfg
 
 
@@ -342,66 +364,149 @@ def _fresh(d, secs=15.0):
     return bool(d) and (time.time() - float(d.get('ts') or 0)) < secs
 
 
+_CPU_PREV = None
+_CPU_PREV_T = 0.0
+_CPU_CACHE = [0.0, None]      # [采样时间, 占用率]
+
+
+def cpu_usage():
+    """整机 CPU 占用率（GetSystemTimes 两次采样之差，不需要 psutil）。"""
+    global _CPU_PREV, _CPU_PREV_T
+    idle, kern, user = FILETIME(), FILETIME(), FILETIME()
+    if not kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern),
+                                   ctypes.byref(user)):
+        return None
+
+    def val(ft):
+        return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+    now = time.time()
+    cur = (val(idle), val(kern), val(user))
+    prev, prev_t = _CPU_PREV, _CPU_PREV_T
+    _CPU_PREV, _CPU_PREV_T = cur, now
+    # 满载时窗口线程可能被饿 10 秒以上; 30 秒内的差值仍是有效平均值。
+    if prev is None or now - prev_t > 30.0:
+        return None
+    d_idle = cur[0] - prev[0]
+    d_total = (cur[1] - prev[1]) + (cur[2] - prev[2])
+    if d_total <= 0 or d_idle < 0:
+        return None
+    return min(100.0, max(0.0, (d_total - d_idle) * 100.0 / d_total))
+
+
+def _cpu_sample_loop():
+    """后台 1 秒采样: 不依赖窗口重绘节拍, 满载时也不会因为断档显示 --%。"""
+    while True:
+        v = cpu_usage()
+        if v is not None:
+            _CPU_CACHE[0] = time.time()
+            _CPU_CACHE[1] = v
+        time.sleep(1.0)
+
+
+def cached_cpu_usage():
+    t, v = _CPU_CACHE
+    if v is None or (time.time() - t) > 30.0:
+        return None
+    return v
+
+
 def collect(cfg):
-    """返回 [(文字, 角色)]，角色: fg / dim / sep / hot0..hot2"""
+    """返回 [(文字, 角色)]，角色: fg / dim / sep / label / hot0..hot2"""
     cpu = _json(os.path.join(STATUS_DIR, 'cpu.json'))
     fan = _json(os.path.join(STATUS_DIR, 'fan.json'))
     cpu = cpu if _fresh(cpu) else {}
     fan = fan if _fresh(fan) else {}
     segs = []
+    mode = cfg.get('labels') or 'short'
+
+    def add(label, text, role='fg'):
+        if segs:
+            segs.append(('\u00b7', 'sep'))
+        if label:
+            segs.append((label, 'label'))
+        segs.append((text, role))
 
     for f in cfg['fields']:
         if f == 'freq':
             v = cpu.get('freq_mhz')
-            segs.append(('%.1fG' % (v / 1000.0) if v else '--G', 'fg' if v else 'dim'))
-        elif f in ('temp', 'dts'):
-            # EC 温度优先用风扇服务(5 秒一读)；CPU 服务的 EC 缓存是 15 秒一读, 会滞后
-            t = fan.get('ec') if f == 'temp' else cpu.get('dts')
-            if t is None:
-                t = cpu.get('ec') if f == 'temp' else fan.get('dts')
-            if t is None:
-                segs.append(('--\u00b0', 'dim'))
+            add(None, '%.1fG' % (v / 1000.0) if v else '--G', 'fg' if v else 'dim')
+        elif f == 'cpu':
+            u = cached_cpu_usage()
+            if u is None:
+                add('CPU' if mode != 'none' else None, '--%', 'dim')
             else:
-                segs.append(('%d\u00b0' % t, 'hot0' if t < 60 else ('hot1' if t < 80 else 'hot2')))
+                add('CPU' if mode != 'none' else None, '%d%%' % round(u),
+                    'hot2' if u >= 90 else ('hot1' if u >= 70 else 'fg'))
+        elif f in ('temp', 'dts'):
+            # EC 温度优先用风扇服务(5 秒一读); 但风扇循环被 EC 卡住时 ec_ts 会变旧,
+            # 超过 20 秒就退回 CPU 服务的 EC 缓存 —— 不能把旧温度当新读数显示。
+            if f == 'temp':
+                ec_ts = fan.get('ec_ts') or fan.get('ts') or 0
+                if fan.get('ec') is not None and (time.time() - ec_ts) < 20.0:
+                    t = fan.get('ec')
+                else:
+                    t = cpu.get('ec')
+            else:
+                t = cpu.get('dts')
+                if t is None:
+                    t = fan.get('dts')
+            lb = ('EC' if f == 'temp' else 'DTS') if mode == 'full' else None
+            if t is None:
+                add(lb, '--\u00b0', 'dim')
+            else:
+                add(lb, '%d\u00b0' % t,
+                    'hot0' if t < 60 else ('hot1' if t < 80 else 'hot2'))
         elif f == 'fan':
             v = fan.get('rpm')
-            segs.append(('%d' % v if v else '----', 'fg' if v else 'dim'))
+            add('FAN' if mode == 'full' else None,
+                '%d' % v if v else '----', 'fg' if v else 'dim')
         elif f == 'gear':
             v = fan.get('hfsp')
             if v is None:
-                segs.append(('--', 'dim'))
+                add(None, '--', 'dim')
             elif v & 0x80:
-                segs.append(('\u81ea\u52a8', 'dim'))
+                add(None, 'AUTO', 'dim')
             else:
-                segs.append(('%d\u6863' % (v & 0x7F), 'fg'))
+                n = v & 0x7F
+                add(None, 'OFF' if n == 0 else ('FULL' if n >= 0x40 else 'L%d' % n), 'fg')
         elif f == 'pkg':
             v = fan.get('pkg')
-            segs.append(('%dW' % round(v) if v else '--W', 'fg' if v else 'dim'))
+            add('PKG' if mode == 'full' else None,
+                '%dW' % round(v) if v else '--W', 'fg' if v else 'dim')
         elif f == 'pl':
+            lb = 'PL' if mode == 'full' else None
             if cpu.get('pl1'):
-                segs.append(('%d/%d' % (round(cpu['pl1']), round(cpu['pl2'])), 'dim'))
+                add(lb, '%d/%dW' % (round(cpu['pl1']), round(cpu.get('pl2') or 0)), 'dim')
             else:
-                segs.append(('--/--', 'dim'))
+                add(lb, '--/--', 'dim')
         elif f == 'mem':
             ms = MEMORYSTATUSEX()
             ms.dwLength = ctypes.sizeof(ms)
             if kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
-                segs.append(('%d%%' % ms.dwMemoryLoad, 'dim'))
+                pct = ms.dwMemoryLoad
+                add('MEM' if mode != 'none' else None, '%d%%' % pct,
+                    'hot1' if pct >= 85 else 'dim')
             else:
-                segs.append(('--%', 'dim'))
+                add('MEM' if mode != 'none' else None, '--%', 'dim')
         elif f == 'batt':
             sp = SYSTEM_POWER_STATUS()
             if kernel32.GetSystemPowerStatus(ctypes.byref(sp)) and sp.BatteryLifePercent != 255:
-                segs.append(('%d%%' % sp.BatteryLifePercent, 'dim'))
+                pct = sp.BatteryLifePercent
+                add('BAT' if mode != 'none' else None, '%d%%' % pct,
+                    'hot2' if pct <= 15 else ('hot1' if pct <= 30 else 'dim'))
             else:
-                segs.append(('--%', 'dim'))
+                add('BAT' if mode != 'none' else None, '--%', 'dim')
         elif f == 'guard':
             lv = cpu.get('level')
-            name = {'warn': '\u964d\u6863', 'crit': '\u538b1', 'crit2': '\u538b2',
-                    'crit3': '\u538b3', 'flag': '\u6807\u5fd7', 'trip': '\u6807\u5fd7'}.get(lv or '', '\u6b63\u5e38')
-            segs.append((name, 'hot1' if lv else 'dim'))
+            name, role = {
+                'warn': ('WARN', 'hot1'), 'crit': ('T1', 'hot1'),
+                'crit2': ('T2', 'hot2'), 'crit3': ('T3', 'hot2'),
+                'flag': ('FLAG', 'hot1'), 'trip': ('FLAG', 'hot2'),
+            }.get(lv or '', ('OK', 'dim'))
+            add(None, name, role)
         elif f == 'time':
-            segs.append((time.strftime('%H:%M'), 'dim'))
+            add(None, time.strftime('%H:%M'), 'dim')
     return segs
 
 
@@ -433,6 +538,9 @@ class Hud(object):
         self.tmemdc = None
         self.tdib = None
         self.tbits = None
+        self.smemdc = None
+        self.sdib = None
+        self.sbits = None
 
     # ---- 尺寸
     def taskbar(self):
@@ -448,7 +556,7 @@ class Hud(object):
         fh = max(9, int(round(tb_h * 0.26 * s)))          # 与任务栏时钟字高相当
         hei = min(tb_h - 4, max(fh + 8, int(round(tb_h * 0.62 * s))))
         pad = max(4, int(round(fh * 0.70)))
-        gap = max(6, int(round(fh * 0.62)))
+        gap = max(6, int(round(fh * 0.55)))
         radius = max(3, int(round(hei * 0.34)))
         return rc, tb_h, fh, hei, pad, gap, radius
 
@@ -462,6 +570,24 @@ class Hud(object):
         sz = w.SIZE()
         gdi32.GetTextExtentPoint32W(hdc, text, len(text), ctypes.byref(sz))
         return sz.cx
+
+    def spacing(self, i, gap):
+        """第 i 段前的间距：分隔点、标签后收紧，其余用标准间距。"""
+        if i <= 0:
+            return 0
+        cur, prev = self.segs[i][1], self.segs[i - 1][1]
+        if cur == 'sep' or prev == 'sep':
+            return max(3, int(round(gap * 0.45)))
+        if prev == 'label':
+            return max(2, int(round(gap * 0.32)))
+        return gap
+
+    def screen_rect(self):
+        left = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+        top = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        return w.RECT(left, top,
+                      left + user32.GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                      top + user32.GetSystemMetrics(SM_CYVIRTUALSCREEN))
 
     def make_font(self, hdc, fh):
         if self.font and self.font_px == fh:
@@ -494,17 +620,20 @@ class Hud(object):
 
         self.memdc, self.dib, self.bits = mk()
         self.tmemdc, self.tdib, self.tbits = mk()
+        self.smemdc, self.sdib, self.sbits = mk()
         user32.ReleaseDC(None, hdc)
         self.buf_size = (wid, hei)
 
     def free_buffers(self):
-        for dc, dib in ((self.memdc, self.dib), (self.tmemdc, self.tdib)):
+        for dc, dib in ((self.memdc, self.dib), (self.tmemdc, self.tdib),
+                        (self.smemdc, self.sdib)):
             if dib:
                 gdi32.DeleteObject(dib)
             if dc:
                 gdi32.DeleteDC(dc)
         self.memdc = self.dib = self.bits = None
         self.tmemdc = self.tdib = self.tbits = None
+        self.smemdc = self.sdib = self.sbits = None
         self.buf_size = (0, 0)
 
     # ---- 建窗
@@ -537,7 +666,7 @@ class Hud(object):
 
     # ---- 合成 + 上屏
     def refresh(self):
-        if not self.hwnd:
+        if not self.hwnd or self.dragging:
             return
         self.segs = collect(self.cfg)
         rc, tb_h, fh, hei, pad, gap, radius = self.metrics()
@@ -546,7 +675,8 @@ class Hud(object):
             self.make_font(hdc, fh)
             gdi32.SelectObject(hdc, self.font)
             self.widths = [self.measure(hdc, t) for t, _r in self.segs]
-            wid = max(40, sum(self.widths) + gap * max(0, len(self.segs) - 1) + pad * 2)
+            gaps = sum(self.spacing(i, gap) for i in range(1, len(self.segs)))
+            wid = max(40, sum(self.widths) + gaps + pad * 2)
         finally:
             user32.ReleaseDC(self.hwnd, hdc)
 
@@ -555,11 +685,13 @@ class Hud(object):
         x, y = r.left, r.top
         if self.auto_pos:
             x = rc.right - int(self.cfg.get('offset_right') or 470) - wid
-            x = max(rc.left + 6, min(x, rc.right - wid - 6))
             y = rc.top + (tb_h - hei) // 2
+        mon = self.screen_rect()
+        x = max(mon.left, min(x, mon.right - wid))
+        y = max(mon.top, min(y, mon.bottom - hei))
         if (r.right - r.left) != wid or (r.bottom - r.top) != hei:
             user32.SetWindowPos(self.hwnd, HWND_TOPMOST, x, y, wid, hei, SWP_NOACTIVATE)
-        elif self.auto_pos and (r.left != x or r.top != y):
+        elif r.left != x or r.top != y:
             user32.SetWindowPos(self.hwnd, HWND_TOPMOST, x, y, 0, 0,
                                 SWP_NOSIZE | SWP_NOACTIVATE)
         self.render(wid, hei, pad, gap, radius)
@@ -569,27 +701,37 @@ class Hud(object):
         pal = self.palette()
 
         # 1) 文字画到临时 DIB（白字黑底 -> 亮度即覆盖度）
+        pill = self.cfg.get('pill', True)
         ctypes.memset(self.tbits, 0, wid * hei * 4)
         gdi32.SetBkMode(self.tmemdc, TRANSPARENT)
         gdi32.SelectObject(self.tmemdc, self.font)
         gdi32.SetTextColor(self.tmemdc, 0x00FFFFFF)
+        if not pill:
+            ctypes.memset(self.sbits, 0, wid * hei * 4)
+            gdi32.SetBkMode(self.smemdc, TRANSPARENT)
+            gdi32.SelectObject(self.smemdc, self.font)
+            gdi32.SetTextColor(self.smemdc, 0x00FFFFFF)
         box = w.RECT(0, 0, 0, hei)
         x = pad
         self.spans = []
         for i, (txt, role) in enumerate(self.segs):
             if i:
-                x += gap
+                x += self.spacing(i, gap)
             bw = self.widths[i] if i < len(self.widths) else 0
             box.left, box.right = x, x + bw + 3
             user32.DrawTextW(self.tmemdc, txt, -1, ctypes.byref(box),
                              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
+            if not pill:
+                sbox = w.RECT(x + 1, 1, x + bw + 4, hei + 1)
+                user32.DrawTextW(self.smemdc, txt, -1, ctypes.byref(sbox),
+                                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
             self.spans.append((x, x + bw + 3, role))
             x += bw
 
         cov = ctypes.string_at(self.tbits, wid * hei * 4)
+        sh_cov = None if pill else ctypes.string_at(self.sbits, wid * hei * 4)
 
         # 2) 背景 + 文字合成（预乘 alpha）
-        pill = self.cfg.get('pill', True)
         pr, pg, pb, pa = pal['pill']
         if self.hover and pill:
             pr, pg, pb = min(255, pr + 14), min(255, pg + 14), min(255, pb + 14)
@@ -604,7 +746,7 @@ class Hud(object):
             dy = py - cy
             return dx * dx + dy * dy <= r * r
 
-        colors = {k: pal[k] for k in ('fg', 'dim', 'sep')}
+        colors = {k: pal[k] for k in ('fg', 'dim', 'sep', 'label')}
         hot = dict(pal['hot'])
         out = bytearray(wid * hei * 4)
 
@@ -616,6 +758,10 @@ class Hud(object):
                 a_text = cov[ai]          # 灰度即覆盖度（白字）
                 a_bg = 0
                 br = bg_ = bb = 0
+                if sh_cov is not None:
+                    a_sh = sh_cov[ai] * 118 // 255
+                    if a_sh:
+                        a_bg = a_sh        # 无底框时给文字一层淡阴影，浅色壁纸也能看清
                 if pill and inside(px, py):
                     a_bg = pa
                     br, bg_, bb = pr, pg, pb
@@ -784,6 +930,14 @@ class Hud(object):
             ex &= ~WS_EX_TRANSPARENT
         user32.SetWindowLongW(self.hwnd, GWL_EXSTYLE, ex)
 
+    def save_pos(self):
+        r = w.RECT()
+        user32.GetWindowRect(self.hwnd, ctypes.byref(r))
+        self.cfg['x'], self.cfg['y'] = r.left, r.top
+        self.auto_pos = False
+        save_cfg(self.cfg)
+        self.refresh()
+
     def notify(self, title, text):
         """托盘气泡提醒。"""
         if not self.nid:
@@ -834,6 +988,10 @@ class Hud(object):
             user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if key in cur else 0), 200 + i, label)
         user32.AppendMenuW(hm, MF_STRING, 250, '全部显示')
         user32.AppendMenuW(hm, MF_STRING, 251, '只留 频率/温度/风扇')
+        lm = self.cfg.get('labels') or 'short'
+        for i, (label, val) in enumerate((('完整', 'full'), ('简短', 'short'), ('隐藏', 'none'))):
+            user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if lm == val else 0),
+                               530 + i, '标签: ' + label)
         user32.AppendMenuW(hm, MF_SEPARATOR, 0, None)
         sc = float(self.cfg.get('scale') or 1.0)
         for i, (label, val) in enumerate(SCALES):
@@ -880,6 +1038,10 @@ class Hud(object):
             self.refresh()
         elif cmd == 251:
             self.cfg['fields'] = ['freq', 'temp', 'fan']
+            save_cfg(self.cfg)
+            self.refresh()
+        elif 530 <= cmd < 533:
+            self.cfg['labels'] = ('full', 'short', 'none')[cmd - 530]
             save_cfg(self.cfg)
             self.refresh()
         elif 500 <= cmd < 500 + len(SCALES):
@@ -957,11 +1119,7 @@ class Hud(object):
             if msg == WM_LBUTTONUP and self.dragging:
                 self.dragging = False
                 user32.ReleaseCapture()
-                r = w.RECT()
-                user32.GetWindowRect(hwnd, ctypes.byref(r))
-                self.cfg['x'], self.cfg['y'] = r.left, r.top
-                self.auto_pos = False
-                save_cfg(self.cfg)
+                self.save_pos()
                 return 0
             if msg == WM_RBUTTONUP:
                 self.menu()
@@ -1025,7 +1183,22 @@ def set_autostart(on):
         print('autostart error:', exc)
 
 
+LOG_PATH = os.path.join(BASE, 'error.log')
+
+
+def _log_exc(exc_type, exc, tb):
+    """pythonw 没有控制台：把异常写进 error.log，否则窗口一闪就没、什么都查不到。"""
+    try:
+        import traceback
+        with open(LOG_PATH, 'a', encoding='utf-8') as fh:
+            fh.write('===== %s =====\n' % time.strftime('%Y-%m-%d %H:%M:%S'))
+            traceback.print_exception(exc_type, exc, tb, file=fh)
+    except Exception:
+        pass
+
+
 def main():
+    sys.excepthook = _log_exc
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
@@ -1034,9 +1207,17 @@ def main():
         except Exception:
             pass
 
-    kernel32.CreateMutexW(None, False, APP_NAME + '_mutex')
-    if ctypes.get_last_error() == 183:
+    kernel32.SetLastError(0)
+    kernel32.CreateMutexW(None, False, 'Global\\' + APP_NAME + '_mutex')
+    err = ctypes.get_last_error()
+    if err == 183:            # ERROR_ALREADY_EXISTS
         return 0
+
+    try:
+        kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x00008000)  # ABOVE_NORMAL
+    except Exception:
+        pass
+    threading.Thread(target=_cpu_sample_loop, daemon=True, name='cpu-sample').start()
 
     cfg = load_cfg()
     if '--reset' in sys.argv:
