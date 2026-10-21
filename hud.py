@@ -119,23 +119,24 @@ DEFAULT_CFG = {
     'theme': 'auto',
     'pill': True,
     'labels': 'short',
-    'locked': False,
+    'locked': False,          # 锁定拖动（右键菜单仍可用）
+    'click_through': False,   # 点击穿透（鼠标完全穿过，只能用 7-解锁.bat 恢复）
     'offset_right': 470,
 }
 
 # 调色板（BGR）
 PALETTE = {
     'dark': {
-        'pill': (44, 44, 47, 205), 'line': (90, 90, 96, 70),
-        'fg': (234, 234, 236), 'dim': (156, 156, 162), 'sep': (108, 108, 114),
-        'label': (136, 136, 142),
-        'hot': [(60, (134, 201, 143)), (80, (92, 182, 224)), (999, (107, 116, 232))],
+        'pill': (32, 32, 35, 214), 'line': (255, 255, 255, 14),
+        'fg': (240, 240, 242), 'dim': (158, 158, 165), 'sep': (94, 94, 100),
+        'label': (140, 140, 147),
+        'hot': [(80, (224, 178, 96)), (90, (240, 110, 106)), (999, (240, 110, 106))],
     },
     'light': {
-        'pill': (250, 250, 252, 225), 'line': (120, 120, 128, 60),
-        'fg': (27, 27, 30), 'dim': (91, 91, 96), 'sep': (150, 150, 156),
-        'label': (118, 118, 124),
-        'hot': [(60, (67, 158, 88)), (80, (23, 127, 196)), (999, (62, 62, 216))],
+        'pill': (250, 250, 252, 232), 'line': (20, 20, 24, 14),
+        'fg': (26, 26, 28), 'dim': (92, 92, 99), 'sep': (150, 150, 156),
+        'label': (118, 118, 125),
+        'hot': [(80, (196, 136, 36)), (90, (200, 68, 64)), (999, (200, 68, 64))],
     },
 }
 
@@ -449,7 +450,7 @@ def collect(cfg):
                 add('CPU' if mode != 'none' else None, '--%', 'dim')
             else:
                 add('CPU' if mode != 'none' else None, '%d%%' % round(u),
-                    'hot2' if u >= 90 else ('hot1' if u >= 70 else 'fg'))
+                    'hot2' if u >= 90 else ('hot1' if u >= 75 else 'fg'))
         elif f in ('temp', 'dts'):
             # EC 温度优先用风扇服务(5 秒一读); 但风扇循环被 EC 卡住时 ec_ts 会变旧,
             # 超过 20 秒就退回 CPU 服务的 EC 缓存 —— 不能把旧温度当新读数显示。
@@ -468,7 +469,7 @@ def collect(cfg):
                 add(lb, '--\u00b0', 'dim')
             else:
                 add(lb, '%d\u00b0' % t,
-                    'hot0' if t < 60 else ('hot1' if t < 80 else 'hot2'))
+                    'fg' if t < 80 else ('hot1' if t < 90 else 'hot2'))
         elif f == 'fan':
             v = fan.get('rpm')
             add('FAN' if mode == 'full' else None,
@@ -565,11 +566,11 @@ class Hud(object):
     def metrics(self):
         rc, tb_h = self.taskbar()
         s = float(self.cfg.get('scale') or 1.0)
-        fh = max(9, int(round(tb_h * 0.26 * s)))          # 与任务栏时钟字高相当
+        fh = max(9, int(round(tb_h * 0.27 * s)))          # 与任务栏时钟字高相当
         hei = min(tb_h - 4, max(fh + 8, int(round(tb_h * 0.62 * s))))
-        pad = max(4, int(round(fh * 0.70)))
-        gap = max(6, int(round(fh * 0.55)))
-        radius = max(3, int(round(hei * 0.34)))
+        pad = max(6, int(round(fh * 0.95)))
+        gap = max(7, int(round(fh * 0.80)))
+        radius = max(3, hei // 2)          # 胶囊：半径取高度一半，最贴 Win11
         return rc, tb_h, fh, hei, pad, gap, radius
 
     def palette(self):
@@ -959,10 +960,26 @@ class Hud(object):
         threading.Thread(target=waiter, daemon=True).start()
         self._dbg('toggle thread started, evt=%s' % evt)
 
+    def read_cmd(self):
+        """读 hud/cmd.json 里的命令（读完即删）。没有就返回空串。"""
+        p = os.path.join(BASE, 'cmd.json')
+        try:
+            with open(p, encoding='utf-8') as fh:
+                cmd = (json.load(fh) or {}).get('cmd') or ''
+        except Exception:
+            return ''
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+        return cmd
+
     def apply_lock(self):
-        """锁定位置 = 加 WS_EX_TRANSPARENT，鼠标点击穿过（就不会挡住任务栏图标）。"""
+        """点击穿透 = WS_EX_TRANSPARENT（鼠标完全穿过）。
+        注意: 穿透后连右键菜单都收不到 —— 只能用 hud\7-解锁.bat 召回来,
+        所以它和"锁定拖动"是两个独立开关, 默认都关。"""
         ex = user32.GetWindowLongW(self.hwnd, GWL_EXSTYLE)
-        if self.cfg.get('locked'):
+        if self.cfg.get('click_through'):
             ex |= WS_EX_TRANSPARENT
         else:
             ex &= ~WS_EX_TRANSPARENT
@@ -971,6 +988,14 @@ class Hud(object):
     def save_pos(self):
         r = w.RECT()
         user32.GetWindowRect(self.hwnd, ctypes.byref(r))
+        rc, tb_h = self.taskbar()
+        h = r.bottom - r.top
+        # 吸附任务栏中线：松手时离得够近就自动对齐，免得"飘"在任务栏上沿
+        if abs((r.top + h // 2) - (rc.top + tb_h // 2)) <= max(14, tb_h // 4):
+            new_top = rc.top + (tb_h - h) // 2
+            user32.SetWindowPos(self.hwnd, HWND_TOPMOST, r.left, new_top, 0, 0,
+                                SWP_NOSIZE | SWP_NOACTIVATE)
+            r.top = new_top
         self.cfg['x'], self.cfg['y'] = r.left, r.top
         self.auto_pos = False
         save_cfg(self.cfg)
@@ -1042,7 +1067,9 @@ class Hud(object):
         user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if self.cfg.get('pill', True) else 0),
                            520, '底框')
         user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if self.cfg.get('locked') else 0),
-                           521, '锁定位置（点击穿过）')
+                           521, '锁定拖动位置')
+        user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if self.cfg.get('click_through') else 0),
+                           522, '点击穿透（需 7-解锁.bat 恢复）')
         user32.AppendMenuW(hm, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if is_autostart() else 0), 300, '开机自启')
         user32.AppendMenuW(hm, MF_STRING, 301, '恢复默认位置')
@@ -1099,6 +1126,9 @@ class Hud(object):
         elif cmd == 521:
             self.cfg['locked'] = not self.cfg.get('locked')
             save_cfg(self.cfg)
+        elif cmd == 522:
+            self.cfg['click_through'] = not self.cfg.get('click_through')
+            save_cfg(self.cfg)
             self.apply_lock()
         elif cmd == 300:
             set_autostart(not is_autostart())
@@ -1119,8 +1149,20 @@ class Hud(object):
                     self.refresh()
                 return 0
             if msg == WM_TOGGLE:
-                self._dbg('WM_TOGGLE -> %s' % (not self.visible))
-                self.set_visible(not self.visible)
+                cmd = self.read_cmd()
+                self._dbg('cmd=%s (visible=%s)' % (cmd, self.visible))
+                if cmd == 'show':
+                    self.set_visible(True)
+                elif cmd == 'hide':
+                    self.set_visible(False)
+                elif cmd == 'unlock':
+                    self.cfg['click_through'] = False
+                    self.cfg['locked'] = False
+                    save_cfg(self.cfg)
+                    self.apply_lock()
+                    self.set_visible(True)
+                else:
+                    self.set_visible(not self.visible)
                 return 0
             if msg == WM_TRAY:
                 ev = lparam & 0xFFFF
@@ -1130,6 +1172,8 @@ class Hud(object):
                     self.set_visible(not self.visible)
                 return 0
             if msg == WM_LBUTTONDOWN:
+                if self.cfg.get('locked'):
+                    return 0          # 锁定拖动：右键菜单仍可用
                 self.dragging = True
                 pt = w.POINT()
                 user32.GetCursorPos(ctypes.byref(pt))
@@ -1248,10 +1292,22 @@ def main():
         except Exception:
             pass
 
-    if '--toggle' in sys.argv:
+    if ('--toggle' in sys.argv) or ('--cmd' in sys.argv):
         # 已经有一个在跑 -> 通知它切换显示/隐藏；没跑 -> 继续往下正常启动
         m = kernel32.OpenMutexW(0x00100000, False, 'Global\\' + APP_NAME + '_mutex')
         if m:
+            cmd = 'toggle'
+            if '--cmd' in sys.argv:
+                i = sys.argv.index('--cmd')
+                if i + 1 < len(sys.argv):
+                    cmd = sys.argv[i + 1]
+            try:
+                tmp = os.path.join(BASE, 'cmd.json.tmp')
+                with open(tmp, 'w', encoding='utf-8') as fh:
+                    json.dump({'cmd': cmd}, fh)
+                os.replace(tmp, os.path.join(BASE, 'cmd.json'))
+            except Exception:
+                pass
             evt = kernel32.OpenEventW(0x0002, False, TOGGLE_EVT)   # EVENT_SET_STATE
             if evt:
                 kernel32.SetEvent(evt)

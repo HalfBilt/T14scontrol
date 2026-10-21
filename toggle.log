@@ -2,3 +2,15 @@
 19:40:43 WM_TOGGLE -> False
 19:41:34 WM_TOGGLE -> True
 19:43:14 WM_TOGGLE -> False
+19:50:08 WM_TOGGLE -> True
+00:06:17 toggle thread started, evt=528
+00:13:36 WM_TOGGLE -> False
+00:14:00 toggle thread started, evt=328
+00:14:41 WM_TOGGLE -> True
+00:21:17 toggle thread started, evt=528
+00:21:44 cmd= (visible=True)
+00:21:59 toggle thread started, evt=520
+00:22:03 cmd=unlock (visible=False)
+00:24:22 toggle thread started, evt=528
+00:26:00 toggle thread started, evt=528
+00:26:45 toggle thread started, evt=528
