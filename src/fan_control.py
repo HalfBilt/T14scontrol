@@ -83,8 +83,9 @@ MSR_PKG_ENERGY   = 0x611   # PKG_ENERGY_STATUS, 32 位能量计数器(会回绕)
 
 # ★2026-10-20 本机全档位实测标定(手册 scripts/风扇档位-20261020-075530.txt):
 #   0x01=2471  0x02=2858  0x03=3181  0x04=3186  0x05=3167
-#   0x06=3456(低温)~3861(高温)  0x07=3858(≈6档)  0x40=4807(固定, 20~25 秒到位)
-#   ★0x03/0x04/0x05 三档挤在 ~3180, 当不了中间档; 0x07 和 0x06 只差 ~400 转。
+#   0x06=3456(低温)~3880(热态)  0x07=3858(低温)~4380(热态)  0x40=4807(固定, 20~25 秒到位)
+#   ★0x03/0x04/0x05 三档挤在 ~3180, 当不了中间档。
+#   ★0x08~0x3F 热态下与 0x07 同速(A/B 差 <10 RPM) —— 本机没有 7 档/满速之间的中间档。
 #   ★本机原生自动(0x80)天花板 ≈3900, 到不了 7 档 —— 所以不要指望"交还 EC"能压住温度。
 # ★0x06 的实测值是 3456(低温时), 之前写 3600 是抄错的 —— 曲线按 RPM 排必须用实测值。
 LEVEL_RPM = {0: 0, 1: 2471, 2: 2858, 3: 3181, 4: 3186,
@@ -125,15 +126,24 @@ DEFAULT_CONFIG = {
     "load_release_pct": 55.0,   # 占用回落到该值以下
     "load_release_s": 10.0,     #   持续该秒数才解除前馈
     # ---- 降档保护 ----
-    "dwell_s": 60,           # 换档后 N 秒内不降档(防边界横跳); 0=不限制
-    #   ★25 -> 60: 实测日志里档位每 20~90 秒就跳一次(0x02<->0x03<->0x06),
-    #   风扇会一直"呜——呜——"地换挡。降档驻留拉长到 60 秒, 升档仍然立即。
+    "dwell_s": 90,           # 换档后 N 秒内不降档(防边界横跳); 0=不限制
+    #   ★25 -> 60 -> 90: 实测日志里档位每 20~90 秒就跳一次(0x02<->0x03<->0x06),
+    #   风扇会一直"呜——呜——"地换挡。降档驻留拉长到 90 秒, 升档仍然立即。
     #   ★2026-10-20 补温度条件(dwell_hold): 驻留只在"温度仍在当前档触发点
     #   dwell_temp_margin 以内"时才压住; 掉得够远立刻降档。否则一次 3 秒尖峰
-    #   拉起档位后, 温度早回 50°C 了还要白吹 60 秒。
+    #   拉起档位后, 温度早回 50°C 了还要白吹 90 秒。
     "dwell_temp_margin": 10.0,   # 驻留判据的温度余量(°C); 0=退回"无条件驻留"
-    # 满速档的退出温度(进 84 / 退 78): 28W 满载时 7 档压不住, 不设这个值就会
-    # 每 25 秒"满速<->7 档"锯齿一次(见 decide_level 注释); 0=关闭, 退化成普通滞回
+    # ★2026-10-21: 满速档单独给更短的驻留。0x40 比热态 7 档(~4380)高 ~420 RPM
+    #   (低温标定时 7 档只有 3858, 差 ~950 —— 曲线用的 72~80°C 段是热态),
+    #   满载结束后多吹 90 秒太吵; 而它在高功耗下本来就会被下面的功耗门压住。
+    "full_dwell_s": 45,      # 满速档驻留秒数; 0=沿用 dwell_s
+    # ★2026-10-21: 满速档不能只看温度退出。28W 满载时 7 档压不住(实测爬到 95°C),
+    #   而 EC 慢/DTS 有抖动, 可能短暂掉到 74°C 以下; 只要封装功耗仍 >= 25W,
+    #   就保持满速。0=关闭这道门(仅按温度退出)。
+    "full_exit_pkg_w": 25.0,
+    # 满速档的退出温度: 28W 空载回落时 7 档仍能接住, 但满载时 7 档压不住,
+    # 不设这个值就会每 25 秒"满速<->7 档"锯齿一次(见 decide_level 注释);
+    # 0=关闭, 退化成普通滞回
     "max_exit_c": 74.0,
     #   ★78 -> 74: 满速的**退出**温度必须明显低于进入温度(84), 因为 0x40 要 20~25 秒
     #   才爬到位、退回 7 档(3858)又要重新爬。实测满速与 7 档降温能力相同(ΔT 都 +33°C),
@@ -191,10 +201,12 @@ class TSCtlBackend(object):
             if not m.ensure_driver(verbose=False):
                 raise RuntimeError('TSCtl 驱动加载失败(需要管理员)')
             # ★2026-10-20: 风扇控制循环绝不能为了等 EC 锁卡十几秒 ——
-            #   实测重载时"循环空档 10~22 秒"反复出现(29 次/共 368 秒), 就是
-            #   ec_read_strict 的 哨兵+目标+哨兵 ×2 轮 每次都等锁 3 秒叠加出来的。
-            #   这里把锁等待压到 400ms: 拿不到就当这轮没读到(用缓存值), 下轮再来。
-            m.EC_LOCK_TIMEOUT_MS = 400
+            #   实测重载时"循环空档 10~22 秒"反复出现(29 次/共 368 秒)。
+            # ★2026-10-21 修正: 以前 _ec_lock 默认 timeout=None(INFINITE), 这里设的
+            #   400ms 从没生效过; 现在锁等待和 IBF 等待都按下面的值封顶 ——
+            #   拿不到就当这一拍没读到(用缓存值), 下一拍再来。
+            m.EC_LOCK_TIMEOUT_MS = 250
+            m.EC_WAIT_TIMEOUT_S = 0.2
             self._cpf = m
         except Exception as exc:
             raise RuntimeError('TSCtl 后端初始化失败: %s' % exc)
@@ -214,8 +226,10 @@ class TSCtlBackend(object):
         return self.ec_write(EC_FAN, level)
 
     def rpm(self):
-        lo = self.ec_read(EC_RPM_LO)
-        hi = self.ec_read(EC_RPM_HI)
+        # 转速只用于显示: 用较轻的一致性读(每寄存器 2 笔), 不用 9 笔的 strict ——
+        # 满载 + HWiNFO 抢 EC 时, 两次 strict 转速读就能把控制循环拖住十几秒。
+        lo = self._cpf.ec_read_ok(EC_RPM_LO, tries=2)
+        hi = self._cpf.ec_read_ok(EC_RPM_HI, tries=2)
         if lo is None or hi is None:
             return None
         return (hi << 8) | lo
@@ -450,7 +464,7 @@ def decide_level(temp, curve, current, hysteresis, max_exit=None):
       -> 拉满 -> 降到 85 -> 驻留期满退回 7 档 -> 再爬上来, 每 25~26 秒一轮
       (11:41:49 满 / 11:42:15 七档 / 11:42:45 满 / 11:43:11 七档 ...)。
       满速档 0x40 光爬速就要 20~25 秒, 退回 7 档等于白爬。
-      把满速的退出温度单独画低(默认 78°C = 进 84 退 78), 28W 稳态就一直待在满速
+      把满速的退出温度单独画低(当前 74°C = 进 80 退 74), 28W 稳态就一直待在满速
       (同负载实测: 满速 -> 核心稳在 80°C; 7 档 -> 爬到 95°C), 锯齿消失。
     """
     if not curve:
@@ -459,6 +473,8 @@ def decide_level(temp, curve, current, hysteresis, max_exit=None):
     for t, lv in curve:
         if temp >= t:
             target = lv
+    if current is None:
+        return target
     if target >= current:
         return target
     if max_exit is not None and current == curve[-1][1]:
@@ -551,6 +567,7 @@ class FanController(object):
         # EC 采样缓存(决策 2 秒一次, EC 仍按 cycle_sec 轮询)
         self._ec_temp = None
         self._ec_t = 0.0
+        self._ec_temp_t = 0.0           # 最近一次**读成功**的时间(HUD 判断温度是否陈旧)
         self._ec_bad = 0
         self._rpm = None
         self._rpm_t = 0.0               # 上次读转速的时间戳
@@ -689,6 +706,7 @@ class FanController(object):
                     self.say("EC 温度恢复正常 %d°C (此前连续异常 %d 次)"
                              % (raw, self._ec_bad))
                 self._ec_temp = raw
+                self._ec_temp_t = now
                 self._ec_bad = 0
             elif raw is not None:
                 self._ec_bad += 1
@@ -708,8 +726,10 @@ class FanController(object):
             interval = self._ec_cycle if now < self._rpm_fast_until else 30.0
             if self._rpm is None or now - self._rpm_t >= interval:
                 try:
-                    self._rpm = self.ec.rpm()
-                    self._rpm_t = now
+                    v = self.ec.rpm()
+                    if v is not None:       # 读失败保留上一次转速, 别让 HUD 闪成 ----
+                        self._rpm = v
+                        self._rpm_t = now
                 except Exception:
                     pass
         return self._ec_temp, self._rpm
@@ -769,7 +789,7 @@ class FanController(object):
             self._ec_init()
         except Exception as exc:
             self.say("FATAL: EC 初始化失败: %s" % exc)
-            self.say("请通过『启动风扇控制.bat』以管理员身份启动。详见 fan_control.log")
+            self.say("请以管理员身份运行 fan 目录下的『4-重启风扇服务.bat』(未安装则先跑『1-安装风扇服务.bat』)。详见 fan_service.log")
             return
         self._control_loop(None, None, None, None)
 
@@ -789,23 +809,28 @@ class FanController(object):
         self.say("服务模式: 以 SYSTEM 身份接管风扇(不依赖用户登录)")
         self._control_loop(stop_evt, wake_evt, resume, pbt_name)
 
-    def _pub_status(self, temp, dts, pkg, rpm):
+    def _pub_status(self):
         """给任务栏 HUD 用的状态快照（原子写，失败不影响控制）。
 
-        节流: 数值没变且距上次写不足 10 秒就跳过（HUD 过期门限 15 秒）。
+        ★2026-10-21: 改由独立心跳线程调用。以前它在控制循环里, EC 一卡(HWiNFO
+          抢总线 / 满载)循环停摆十几秒, fan.json 就过期 -> HUD 的转速和功率变 --。
+          现在控制循环停摆时, 心跳仍用缓存值刷新 ts; 数值没变则最多 10 秒写一次
+          (HUD 过期门限 15 秒), 不增加 SSD 写盘。
         """
         try:
             import json as _json
             d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '..', 'status')
-            obj = {
-                'hfsp': self.current_hfsp,
-                'rpm': rpm,
-                'ec': temp,
-                'dts': dts,
-                'pkg': round(pkg, 1) if pkg is not None else None,
-                'load': round(self.last_load, 1) if self.last_load is not None else None,
-                'mode': self.mode,
-            }
+            with self.lock:
+                obj = {
+                    'hfsp': self.current_hfsp,
+                    'rpm': self.last_rpm,
+                    'ec': self.last_temp,
+                    'ec_ts': round(self._ec_temp_t, 2) if self._ec_temp_t else None,
+                    'dts': self.last_dts,
+                    'pkg': round(self.last_pkg, 1) if self.last_pkg is not None else None,
+                    'load': round(self.last_load, 1) if self.last_load is not None else None,
+                    'mode': self.mode,
+                }
             now = time.time()
             last = getattr(self, '_pub_last', None)
             if last and obj == last[0] and (now - last[1]) < 10.0:
@@ -819,6 +844,10 @@ class FanController(object):
             os.replace(tmp, os.path.join(d, 'fan.json'))
         except Exception:
             pass
+
+    def _pub_loop(self, stop_evt):
+        while not stop_evt.wait(2.0):
+            self._pub_status()
 
     def _control_loop(self, stop_evt, wake_evt, resume, pbt_name):
         """主控制循环。stop_evt/wake_evt 为 None 表示托盘模式(用 self.stop_evt)。"""
@@ -840,9 +869,11 @@ class FanController(object):
         pkg_lv = int(self.cfg.get("pkg_boost_level", 7) or 0)
         rel_pct = float(self.cfg.get("load_release_pct", 55.0))
         rel_s = float(self.cfg.get("load_release_s", 10.0))
-        dwell = float(self.cfg.get("dwell_s", 25) or 0)
+        dwell = float(self.cfg.get("dwell_s", 90) or 0)
+        full_dwell = float(self.cfg.get("full_dwell_s", 0) or 0)
+        full_pkg_w = float(self.cfg.get("full_exit_pkg_w", 0) or 0)
         dwell_margin = float(self.cfg.get("dwell_temp_margin", 10.0) or 0.0)
-        max_exit = float(self.cfg.get("max_exit_c", 78.0) or 0)
+        max_exit = float(self.cfg.get("max_exit_c", 74.0) or 0)
         curve = [[int(t), int(v)] for t, v in self.cfg.get("curve", DEFAULT_CONFIG["curve"])]
         curve.sort(key=lambda x: x[0])
         self.say("启动模式: %s   曲线: %s" % (self.mode, curve))
@@ -853,8 +884,10 @@ class FanController(object):
             (">=%gW 持续 %gs -> %d 档" % (pkg_on, pkg_on_s, pkg_lv))
             if (pkg_on and self.msr) else "关闭",
             ("占用>=%g%% 持续 %gs -> %d 档" % (boost_pct, boost_s, boost_lv)) if boost_lv else "关闭"))
-        self.say("降档: 驻留 %gs(仅当温度仍在触发点 %g°C 内) | 满速档退到 %g°C 才退"
-                 % (dwell, dwell_margin, max_exit))
+        self.say("降档: 驻留 %gs/满速 %gs(仅当温度仍在触发点 %g°C 内) | "
+                 "满速低于 %g°C 且功耗 < %gW 才退"
+                 % (dwell, full_dwell if full_dwell > 0 else dwell,
+                    dwell_margin, max_exit, full_pkg_w))
         # ★2026-10-20: 启动/唤醒后**立刻**写一次档位。
         #   实测固件每 ~30 秒按自己的曲线重写 0x2F, 温度 60~63°C 时它会选 0x01(2471 RPM)
         #   —— 服务没在的时候就是这个状态(用户报的"风扇几乎不转")。
@@ -874,6 +907,9 @@ class FanController(object):
         err_count = 0
         _stop = stop_evt if stop_evt is not None else self.stop_evt
         _wake = wake_evt
+        _pub_stop = threading.Event()
+        threading.Thread(target=self._pub_loop, args=(_pub_stop,), daemon=True,
+                         name='fan-status').start()
         while not _stop.is_set():
             now = time.time()
             # ★休眠/唤醒检测: 内核挂起时本线程也停摆, 醒来 now 会跳一大截。
@@ -952,7 +988,7 @@ class FanController(object):
                 self.last_pkg = pkg
                 self.ff_active, self.pkg_active = ff, ff_pkg
                 mode = self.mode
-            self._pub_status(temp, dts, pkg, rpm)
+            self._pub_status()
 
             try:
                 if mode == "smart":
@@ -971,19 +1007,31 @@ class FanController(object):
                                 self.ec.set_fan(cur)
                             except Exception:
                                 pass
+                        # 固件给得更强时 _guard_hfsp 已接受并改了 current_hfsp;
+                        # 这里必须用最新值决策, 否则下一行会按旧档位把更强的档位写回去。
+                        cur = self.current_hfsp
                     target = decide_level(t_ctrl, curve, cur, hyst, max_exit or None)
                     reason = ""
-                    # 优先级: EC 失效保护 > DTS 锁存 > 固件热状态位 > 功耗 > 负载
+                    dw = (full_dwell if (full_dwell > 0 and curve
+                                         and cur == curve[-1][1]) else dwell)
+                    # 优先级: EC 失效保护 > DTS 锁存 > 固件热状态位 > 高功耗保持满速
+                    #         > 功耗前馈 > 负载前馈 > 驻留
                     if temp is not None and temp >= fs_temp:
                         target, reason = 64, "EC %d°C>=%d°C" % (temp, fs_temp)
                     elif self._dts_latch:
                         target, reason = 64, "DTS %s°C" % (dts if dts is not None else "--")
                     elif bit_hot:
                         target, reason = 64, "固件热状态位"
+                    elif (curve and cur == curve[-1][1] and target < cur
+                          and full_pkg_w > 0 and pkg is not None and pkg >= full_pkg_w):
+                        # ★2026-10-21: 28W 满载时 7 档压不住(实测爬到 95°C)。EC 慢、
+                        #   DTS 有抖动, 可能短暂掉到 max_exit 以下; 只要功耗还在,
+                        #   就不退满速, 避免"满速->7 档->再爬满"的锯齿。
+                        target, reason = cur, "功耗 %.0fW 保持满速" % pkg
                     elif ff_pkg and pkg_lv:
-                        # ★2026-10-20 优化: 功耗前馈不再直接跳满速。45W 持续 3 秒在 1360P 上
+                        # ★2026-10-20 优化: 功耗前馈不再直接跳满速。50W 持续 4 秒在 1360P 上
                         #   很常见(开网页/解压/VS Code 索引), 以前一跳就是 0x40(4807 RPM),
-                        #   再叠加 60 秒驻留 -> "什么都没干风扇狂转一分钟"。
+                        #   再叠加驻留 -> "什么都没干风扇狂转一分钟"。
                         #   现在只抬到 pkg_boost_level(默认 7 档 3858); 真要满速交给温度
                         #   (曲线 >=80°C / DTS>=dts_max / EC>=failsafe), 那才是真热。
                         if pkg_lv > target:
@@ -991,16 +1039,16 @@ class FanController(object):
                     elif ff and boost_lv:
                         if boost_lv > target:
                             target, reason = boost_lv, "负载 %.0f%%" % (load or 0)
-                    elif (self.current_hfsp in LEVEL_RPM and target < self.current_hfsp
-                          and dwell > 0 and (now - self._last_change) < dwell
-                          and dwell_hold(t_ctrl, curve, self.current_hfsp,
+                    elif (cur in LEVEL_RPM and target < cur
+                          and dw > 0 and (now - self._last_change) < dw
+                          and dwell_hold(t_ctrl, curve, cur,
                                          max_exit or None, dwell_margin)):
                         # ★2026-10-20 优化: 驻留原来是无条件的 —— 一次 3 秒尖峰拉起档位后,
-                        #   哪怕温度早就掉回 50°C 也要白吹满 60 秒。旧版其实有温度条件
+                        #   哪怕温度早就掉回 50°C 也要白吹满驻留时间。旧版其实有温度条件
                         #   (temp > 触发点 - 10), 拆分时丢了。现在恢复并做成可调:
                         #   只有温度**仍在当前档触发点 dwell_temp_margin 以内**才驻留;
-                        #   掉得够远就立刻降档。
-                        target = self.current_hfsp      # 驻留期内不降档
+                        #   掉得够远就立刻降档。满速档单独用 full_dwell_s(45s)。
+                        target = cur                     # 驻留期内不降档
                     if target != self.current_hfsp:
                         self._write_level(target, now)
                         self._last_reason = reason
@@ -1058,6 +1106,7 @@ class FanController(object):
         except Exception as exc:
             self.say("收尾写入失败: %s" % exc)
         finally:
+            _pub_stop.set()
             try:
                 self.ec.close()
             except Exception:
@@ -1072,12 +1121,17 @@ class FanController(object):
         ★2026-10-20: 固件会抢 0x2F, 所以写完**立刻回读一次**确认落到目标档;
         没落到就再写一次(最多 2 次) —— 只写不管的话, 实际转速由固件曲线说了算。
         """
+        wrote = False
         for attempt in (1, 2):
             try:
-                self.ec.set_fan(level)
+                ok = self.ec.set_fan(level)
             except Exception as exc:
                 self.say("写档位失败: %s" % exc)
                 break
+            if not ok:
+                self.say("写档位 0x%02X 没被 EC 确认, 下一拍再试" % level)
+                break
+            wrote = True
             try:
                 real = self.ec.ec_read_fast(EC_FAN)
             except Exception:
@@ -1085,17 +1139,19 @@ class FanController(object):
             if real is None or real == level:
                 break
             self.say("档位没落到目标: 写 0x%02X 回读 0x%02X, 重试" % (level, real))
-        self.current_hfsp = level
-        self._last_change = now
-        self._rpm_fast_until = now + 35.0
+        if wrote:
+            self.current_hfsp = level
+            self._last_change = now
+            self._rpm_fast_until = now + 35.0
 
     def _read_hfsp(self):
         try:
             v = self.ec.ec_read_fast(EC_FAN)
-            self.current_hfsp = v
-            return v
         except Exception:
-            return 0
+            return None
+        if v is not None:
+            self.current_hfsp = v
+        return v
 
 
 # ==========================================================================
@@ -1136,6 +1192,9 @@ def selftest():
     check("降档限级: 6 档遇 40C 只降到 3 档", decide_level(40, curve, 6, 4), 3)
     check("降档限级: 满速遇 40C 只降到 7 档", decide_level(40, curve, 64, 4, 74.0), 7)
     check("降档限级: 3 档遇 40C 降到 2 档", decide_level(40, curve, 3, 4), 2)
+    # 当前档位未知(读失败/刚启动)时直接给曲线目标, 不能拿 None 去比较
+    check("当前档未知: 60C -> 3 档", decide_level(60, curve, None, 4), 3)
+    check("当前档未知: 72C -> 7 档", decide_level(72, curve, None, 4), 7)
 
     print("== 2. 负载前馈状态机 (示例参数 70% / 10s 进, 55% / 10s 出) ==")
     ff = LoadFeedforward()

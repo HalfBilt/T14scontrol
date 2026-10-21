@@ -7,7 +7,7 @@
     python fan_service_ctl.py start|stop
 
 服务跑的是 FanControlSvc.py --service, 二进制是"自带 runtime 的 pythonw.exe"。
-注意: PawnIO 驱动必须已安装(风扇侧要读写 EC 0x2F), 否则服务起不来 —— 日志会写明。
+注意: EC 通道走 CPU 侧同一个 TSCtl 驱动, 服务以 SYSTEM 身份运行; 起不来先看 fan_service.log。
 """
 import ctypes
 import os
@@ -65,8 +65,10 @@ def scm():
 
 
 def find_runtime():
-    for p in (os.path.join(APP_DIR, 'runtime', 'pythonw.exe'),
-              os.path.join(APP_DIR, 'runtime', 'python.exe'),
+    # runtime 在 T14scontrol 根目录(fan 的上一级), 不在 fan\runtime。
+    root = os.path.dirname(APP_DIR)
+    for p in (os.path.join(root, 'runtime', 'pythonw.exe'),
+              os.path.join(root, 'runtime', 'python.exe'),
               sys.executable):
         if p and os.path.exists(p):
             return p
@@ -120,7 +122,7 @@ def do_install():
             if adv.StartServiceW(hs, 0, None):
                 print('[*] 服务已启动')
             else:
-                print('[!] 启动失败 %d —— 看 fan_service.log(常见原因: PawnIO 没装)'
+                print('[!] 启动失败 %d —— 看 fan_service.log(常见原因: TSCtl 驱动没起来)'
                       % ctypes.get_last_error())
             adv.CloseServiceHandle(hs)
         return 0

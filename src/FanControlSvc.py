@@ -4,7 +4,7 @@
 为什么不做托盘了:
   1. 托盘程序只在**用户登录后**运行 —— 不登录就没有风扇控制, 只剩固件原生曲线
      (实测原生天花板 ≈3890 RPM, 压不住满载, 手册 02 §1);
-  2. 托盘程序是用户级进程, 拿不到 PawnIO 需要的特权, 也拿不到 'Global\\CpuPLFix-EC'
+  2. 托盘程序是用户级进程, 拿不到 TSCtl 驱动所需的特权, 也拿不到 'Global\\CpuPLFix-EC'
      那把锁的合适权限(服务以 SYSTEM 身份建, 用户进程可能打不开);
   3. 服务由 SCM 在开机早期拉起, 睡眠唤醒后能立刻接管风扇档位。
 
@@ -14,7 +14,7 @@
     这样不会互相插队 —— 插队会读走系统 ACPI EC 驱动正在等的字节 ->
     ACPI 事件 13 -> DSDT 的 _TMP 拿不到温度 -> 固件报 _HOT -> 强制休眠(事件 88)。
 
-用法: 由 fan_control.py install-svc 注册
+用法: 由 fan_service_ctl.py install 注册(或双击 1-安装风扇服务.bat)
     pythonw.exe FanControlSvc.py --service
 """
 import ctypes
@@ -128,7 +128,7 @@ def _pbt_name(t):
 
 
 def _worker():
-    # PawnIO 在服务(session 0)里能不能用, 先试; 不行就退到 console 模式的控制器
+    # 服务(session 0)里用 TSCtl 通道; 初始化失败会把堆栈写进日志
     ctrl = None
     try:
         ctrl = fan.FanController(console=True, log_name="fan_service.log")
@@ -181,4 +181,4 @@ if __name__ == '__main__':
     if '--service' in sys.argv:
         run_service()
     else:
-        print('这是 Windows 服务入口, 请用 fan_control.py install-svc 注册。')
+        print('这是 Windows 服务入口, 请用 fan_service_ctl.py install 注册。')
