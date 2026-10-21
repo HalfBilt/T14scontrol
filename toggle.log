@@ -19,3 +19,10 @@
 00:34:11 cmd=toggle (visible=False)
 00:34:57 cmd=toggle (visible=True)
 00:35:31 toggle thread started, evt=524
+00:36:06 toggle thread started, evt=520
+00:36:10 cmd=toggle (visible=True)
+00:36:14 cmd=unlock (visible=False)
+00:36:39 cmd=toggle (visible=True)
+00:36:58 cmd=unlock (visible=False)
+00:37:06 cmd=unlock (visible=True)
+00:40:24 toggle thread started, evt=528

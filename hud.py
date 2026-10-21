@@ -110,6 +110,27 @@ FIELDS = [
 
 SCALES = [('小', 0.80), ('标准', 1.0), ('大', 1.18), ('特大', 1.38)]
 
+# 分级阈值：(注意, 警告)。常态一律中性白，越过才上暖黄/红 —— 参考 iStat Menus 的做法
+LEVELS = {
+    'temp': (80, 90),      # EC 温度
+    'dts': (88, 95),       # 核心 DTS 本来就比 EC 高
+    'cpu': (75, 90),       # 占用 %
+    'pkg': (40, 55),       # 封装功率 W（PL1 28 / PL2 55）
+    'mem': (85, 95),       # 内存占用 %
+    'batt': (25, 10),      # 电池反比：低于 25 黄、10 红
+}
+
+
+def level_role(key, value):
+    """按阈值给角色：fg(常态) / hot1(注意) / hot2(警告)。"""
+    lim = LEVELS.get(key)
+    if lim is None or value is None:
+        return 'fg'
+    warn, crit = lim
+    if key == 'batt':
+        return 'hot2' if value <= crit else ('hot1' if value <= warn else 'fg')
+    return 'hot2' if value >= crit else ('hot1' if value >= warn else 'fg')
+
 DEFAULT_CFG = {
     'enabled': True,
     'fields': ['freq', 'cpu', 'temp', 'fan'],
@@ -129,13 +150,13 @@ PALETTE = {
     'dark': {
         'pill': (32, 32, 35, 214), 'line': (255, 255, 255, 14),
         'fg': (240, 240, 242), 'dim': (158, 158, 165), 'sep': (94, 94, 100),
-        'label': (140, 140, 147),
+        'label': (140, 140, 147), 'unit': (132, 132, 140),
         'hot': [(80, (224, 178, 96)), (90, (240, 110, 106)), (999, (240, 110, 106))],
     },
     'light': {
         'pill': (250, 250, 252, 232), 'line': (20, 20, 24, 14),
         'fg': (26, 26, 28), 'dim': (92, 92, 99), 'sep': (150, 150, 156),
-        'label': (118, 118, 125),
+        'label': (118, 118, 125), 'unit': (128, 128, 135),
         'hot': [(80, (196, 136, 36)), (90, (200, 68, 64)), (999, (200, 68, 64))],
     },
 }
@@ -425,7 +446,7 @@ def cached_cpu_usage():
 
 
 def collect(cfg):
-    """返回 [(文字, 角色)]，角色: fg / dim / sep / label / hot0..hot2"""
+    """返回 [(文字, 角色)]。角色: fg / dim / sep / label / unit / hot1 / hot2"""
     cpu = _json(os.path.join(STATUS_DIR, 'cpu.json'))
     fan = _json(os.path.join(STATUS_DIR, 'fan.json'))
     cpu = cpu if _fresh(cpu) else {}
@@ -433,27 +454,30 @@ def collect(cfg):
     segs = []
     mode = cfg.get('labels') or 'short'
 
-    def add(label, text, role='fg'):
+    def add(label, text, role='fg', unit=None):
         if segs:
             segs.append(('\u00b7', 'sep'))
         if label:
             segs.append((label, 'label'))
         segs.append((text, role))
+        if unit:
+            segs.append((unit, 'unit'))      # 单位一档更暗，数值才是重点
 
     for f in cfg['fields']:
         if f == 'freq':
             v = cpu.get('freq_mhz')
-            add(None, '%.1fG' % (v / 1000.0) if v else '--G', 'fg' if v else 'dim')
+            if v:
+                add(None, '%.1f' % (v / 1000.0), 'fg', 'G')
+            else:
+                add(None, '--', 'dim', 'G')
         elif f == 'cpu':
             u = cached_cpu_usage()
+            lb = 'CPU' if mode != 'none' else None
             if u is None:
-                add('CPU' if mode != 'none' else None, '--%', 'dim')
+                add(lb, '--', 'dim', '%')
             else:
-                add('CPU' if mode != 'none' else None, '%d%%' % round(u),
-                    'hot2' if u >= 90 else ('hot1' if u >= 75 else 'fg'))
+                add(lb, '%d' % round(u), level_role('cpu', u), '%')
         elif f in ('temp', 'dts'):
-            # EC 温度优先用风扇服务(5 秒一读); 但风扇循环被 EC 卡住时 ec_ts 会变旧,
-            # 超过 20 秒就退回 CPU 服务的 EC 缓存 —— 不能把旧温度当新读数显示。
             if f == 'temp':
                 ec_ts = fan.get('ec_ts') or fan.get('ts') or 0
                 if fan.get('ec') is not None and (time.time() - ec_ts) < 20.0:
@@ -466,10 +490,9 @@ def collect(cfg):
                     t = fan.get('dts')
             lb = ('EC' if f == 'temp' else 'DTS') if mode == 'full' else None
             if t is None:
-                add(lb, '--\u00b0', 'dim')
+                add(lb, '--', 'dim', '\u00b0')
             else:
-                add(lb, '%d\u00b0' % t,
-                    'fg' if t < 80 else ('hot1' if t < 90 else 'hot2'))
+                add(lb, '%d' % t, level_role(f, t), '\u00b0')
         elif f == 'fan':
             v = fan.get('rpm')
             add('FAN' if mode == 'full' else None,
@@ -485,39 +508,41 @@ def collect(cfg):
                 add(None, 'OFF' if n == 0 else ('FULL' if n >= 0x40 else 'L%d' % n), 'fg')
         elif f == 'pkg':
             v = fan.get('pkg')
-            add('PKG' if mode == 'full' else None,
-                '%dW' % round(v) if v else '--W', 'fg' if v else 'dim')
+            lb = 'PKG' if mode == 'full' else None
+            if v:
+                add(lb, '%d' % round(v), level_role('pkg', v), 'W')
+            else:
+                add(lb, '--', 'dim', 'W')
         elif f == 'pl':
             lb = 'PL' if mode == 'full' else None
             if cpu.get('pl1'):
-                add(lb, '%d/%dW' % (round(cpu['pl1']), round(cpu.get('pl2') or 0)), 'dim')
+                add(lb, '%d/%d' % (round(cpu['pl1']), round(cpu.get('pl2') or 0)), 'dim', 'W')
             else:
                 add(lb, '--/--', 'dim')
         elif f == 'mem':
             ms = MEMORYSTATUSEX()
             ms.dwLength = ctypes.sizeof(ms)
             if kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
-                pct = ms.dwMemoryLoad
-                add('MEM' if mode != 'none' else None, '%d%%' % pct,
-                    'hot1' if pct >= 85 else 'dim')
+                add('MEM' if mode == 'full' else None,
+                    '%d' % ms.dwMemoryLoad, level_role('mem', ms.dwMemoryLoad), '%')
             else:
-                add('MEM' if mode != 'none' else None, '--%', 'dim')
+                add('MEM' if mode == 'full' else None, '--', 'dim', '%')
         elif f == 'batt':
             sp = SYSTEM_POWER_STATUS()
             if kernel32.GetSystemPowerStatus(ctypes.byref(sp)) and sp.BatteryLifePercent != 255:
-                pct = sp.BatteryLifePercent
-                add('BAT' if mode != 'none' else None, '%d%%' % pct,
-                    'hot2' if pct <= 15 else ('hot1' if pct <= 30 else 'dim'))
+                add('BAT' if mode == 'full' else None,
+                    '%d' % sp.BatteryLifePercent, level_role('batt', sp.BatteryLifePercent), '%')
             else:
-                add('BAT' if mode != 'none' else None, '--%', 'dim')
+                add('BAT' if mode == 'full' else None, '--', 'dim', '%')
         elif f == 'guard':
-            lv = cpu.get('level')
-            name, role = {
-                'warn': ('WARN', 'hot1'), 'crit': ('T1', 'hot1'),
-                'crit2': ('T2', 'hot2'), 'crit3': ('T3', 'hot2'),
-                'flag': ('FLAG', 'hot1'), 'trip': ('FLAG', 'hot2'),
-            }.get(lv or '', ('OK', 'dim'))
-            add(None, name, role)
+            if not cpu:
+                add(None, '--', 'dim')
+            else:
+                lv = cpu.get('level')
+                name = {'warn': '\u964d\u6863', 'crit': '\u538b1', 'crit2': '\u538b2',
+                        'crit3': '\u538b3', 'flag': '\u6807\u5fd7',
+                        'trip': '\u6807\u5fd7'}.get(lv or '', '\u6b63\u5e38')
+                add(None, name, 'dim' if not lv else 'hot1')
         elif f == 'time':
             add(None, time.strftime('%H:%M'), 'dim')
     return segs
@@ -589,6 +614,8 @@ class Hud(object):
         if i <= 0:
             return 0
         cur, prev = self.segs[i][1], self.segs[i - 1][1]
+        if cur == 'unit' or prev == 'unit':
+            return 0                      # 单位紧贴数值
         if cur == 'sep' or prev == 'sep':
             return max(3, int(round(gap * 0.45)))
         if prev == 'label':
@@ -759,7 +786,7 @@ class Hud(object):
             dy = py - cy
             return dx * dx + dy * dy <= r * r
 
-        colors = {k: pal[k] for k in ('fg', 'dim', 'sep', 'label')}
+        colors = {k: pal[k] for k in ('fg', 'dim', 'sep', 'label', 'unit')}
         hot = dict(pal['hot'])
         out = bytearray(wid * hei * 4)
 
