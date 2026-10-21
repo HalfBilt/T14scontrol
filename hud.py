@@ -540,7 +540,7 @@ class Hud(object):
         self.icon_col = None
         self.hover = False
         self._alert = {}          # {'cpu': 上次提醒时间, 'fan': ...}
-        self.visible = bool(cfg.get('enabled', True))
+        self.visible = True      # 启动一律显示: '隐藏'只在本次运行内有效, 不跨进程继承
         self.auto_pos = cfg.get('x') is None
         self.wndproc_ref = WNDPROC(self._wndproc)
         self.hinst = kernel32.GetModuleHandleW(None)
@@ -671,7 +671,7 @@ class Hud(object):
             APP_NAME, APP_NAME, WS_POPUP, x, y, 170, hei, None, None, self.hinst, None)
         if not self.hwnd:
             raise OSError('CreateWindowExW 失败: %d' % ctypes.get_last_error())
-        user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE if self.visible else SW_HIDE)
+        user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
         user32.SetTimer(self.hwnd, 1, 1000, None)
         self.apply_lock()
         self.start_toggle_thread()
@@ -1156,11 +1156,15 @@ class Hud(object):
                 elif cmd == 'hide':
                     self.set_visible(False)
                 elif cmd == 'unlock':
+                    # 一键回到"能用"的状态：穿透/锁定全关、位置回自动、强制显示
                     self.cfg['click_through'] = False
                     self.cfg['locked'] = False
+                    self.cfg['x'] = self.cfg['y'] = None
+                    self.auto_pos = True
                     save_cfg(self.cfg)
                     self.apply_lock()
                     self.set_visible(True)
+                    self.refresh()
                 else:
                     self.set_visible(not self.visible)
                 return 0

@@ -14,3 +14,8 @@
 00:24:22 toggle thread started, evt=528
 00:26:00 toggle thread started, evt=528
 00:26:45 toggle thread started, evt=528
+00:33:52 cmd=toggle (visible=True)
+00:34:07 toggle thread started, evt=528
+00:34:11 cmd=toggle (visible=False)
+00:34:57 cmd=toggle (visible=True)
+00:35:31 toggle thread started, evt=524
