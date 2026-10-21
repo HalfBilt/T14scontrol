@@ -1018,43 +1018,28 @@ class FanController(object):
                         cur = self.current_hfsp
                     target = decide_level(t_ctrl, curve, cur, hyst, max_exit or None)
                     reason = ""
-                    dw = (full_dwell if (full_dwell > 0 and curve
-                                         and cur == curve[-1][1]) else dwell)
-                    # 优先级: EC 失效保护 > DTS 锁存 > 固件热状态位 > 高功耗保持满速
-                    #         > 功耗前馈 > 负载前馈 > 驻留
+                    # ① 保护类：无条件拉满（温度墙 / DTS / 固件热状态位）
                     if temp is not None and temp >= fs_temp:
                         target, reason = 64, "EC %d°C>=%d°C" % (temp, fs_temp)
                     elif self._dts_latch:
                         target, reason = 64, "DTS %s°C" % (dts if dts is not None else "--")
                     elif bit_hot:
                         target, reason = 64, "固件热状态位"
-                    elif (curve and cur == curve[-1][1] and target < cur
-                          and full_pkg_w > 0 and pkg is not None and pkg >= full_pkg_w):
-                        # ★2026-10-21: 28W 满载时 7 档压不住(实测爬到 95°C)。EC 慢、
-                        #   DTS 有抖动, 可能短暂掉到 max_exit 以下; 只要功耗还在,
-                        #   就不退满速, 避免"满速->7 档->再爬满"的锯齿。
-                        target, reason = cur, "功耗 %.0fW 保持满速" % pkg
-                    elif ff_pkg and pkg_lv:
-                        # ★2026-10-20 优化: 功耗前馈不再直接跳满速。50W 持续 4 秒在 1360P 上
-                        #   很常见(开网页/解压/VS Code 索引), 以前一跳就是 0x40(4807 RPM),
-                        #   再叠加驻留 -> "什么都没干风扇狂转一分钟"。
-                        #   现在只抬到 pkg_boost_level(默认 7 档 3858); 真要满速交给温度
-                        #   (曲线 >=80°C / DTS>=dts_max / EC>=failsafe), 那才是真热。
-                        if pkg_lv > target:
+                    else:
+                        # ② 前馈：只抬不压（功耗优先于负载）
+                        if ff_pkg and pkg_lv and pkg_lv > target:
                             target, reason = pkg_lv, "功耗 %.0fW" % (pkg or 0)
-                    elif ff and boost_lv:
-                        if boost_lv > target:
+                        elif ff and boost_lv and boost_lv > target:
                             target, reason = boost_lv, "负载 %.0f%%" % (load or 0)
-                    elif (cur in LEVEL_RPM and target < cur
-                          and dw > 0 and (now - self._last_change) < dw
-                          and dwell_hold(t_ctrl, curve, cur,
-                                         max_exit or None, dwell_margin)):
-                        # ★2026-10-20 优化: 驻留原来是无条件的 —— 一次 3 秒尖峰拉起档位后,
-                        #   哪怕温度早就掉回 50°C 也要白吹满驻留时间。旧版其实有温度条件
-                        #   (temp > 触发点 - 10), 拆分时丢了。现在恢复并做成可调:
-                        #   只有温度**仍在当前档触发点 dwell_temp_margin 以内**才驻留;
-                        #   掉得够远就立刻降档。满速档单独用 full_dwell_s(45s)。
-                        target = cur                     # 驻留期内不降档
+                    # ③ 驻留：只压"降档"，且温度仍在当前档触发点附近才压
+                    #    ★2026-10-21 修: 原来驻留是 elif 链的一环, 只要前馈分支命中就不判断,
+                    #      导致"负载抬档后想压回去"可以绕过 60 秒驻留(实测 2 秒就来回一次)。
+                    if (target < self.current_hfsp
+                            and self.current_hfsp in LEVEL_RPM
+                            and dwell > 0 and (now - self._last_change) < dwell
+                            and dwell_hold(t_ctrl, curve, self.current_hfsp,
+                                           max_exit or None, dwell_margin)):
+                        target = self.current_hfsp
                     if target != self.current_hfsp:
                         self._write_level(target, now)
                         self._last_reason = reason
