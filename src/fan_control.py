@@ -469,6 +469,12 @@ def decide_level(temp, curve, current, hysteresis, max_exit=None):
     """
     if not curve:
         return current
+    # ★2026-10-21: 0x80(EC 自动)/0x00/0x31 等不是曲线里的档位。以前拿它当"当前档位"参与
+    #   "降一级"计算 —— 它比满速 0x40 还大, 算出来先写 0x40, 下一拍再退 7 档。开机/唤醒
+    #   后固件常留下 0x80, 于是每次接管都先吹 2 秒满速(日志 08:12 / 08:24 两次都是)。
+    #   未知值一律按"没读到档位"处理, 直接按温度给目标。
+    if current is not None and current not in [lv for _t, lv in curve]:
+        current = None
     target = curve[0][1]
     for t, lv in curve:
         if temp >= t:
@@ -1195,6 +1201,9 @@ def selftest():
     # 当前档位未知(读失败/刚启动)时直接给曲线目标, 不能拿 None 去比较
     check("当前档未知: 60C -> 3 档", decide_level(60, curve, None, 4), 3)
     check("当前档未知: 72C -> 7 档", decide_level(72, curve, None, 4), 7)
+    # 0x80(EC 自动)不是档位: 不能被当成"比满速还高"而先写 0x40
+    check("0x80 当前档: 53C -> 1 档", decide_level(53, curve, 0x80, 4, 74.0), 1)
+    check("0x80 当前档: 62C -> 3 档", decide_level(62, curve, 0x80, 4, 74.0), 3)
 
     print("== 2. 负载前馈状态机 (示例参数 70% / 10s 进, 55% / 10s 出) ==")
     ff = LoadFeedforward()
