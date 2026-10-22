@@ -26,3 +26,7 @@
 00:36:58 cmd=unlock (visible=False)
 00:37:06 cmd=unlock (visible=True)
 00:40:24 toggle thread started, evt=528
+17:32:04 toggle thread started, evt=512
+17:32:04 started pid=18140
+17:35:50 toggle thread started, evt=516
+17:35:50 started pid=5128

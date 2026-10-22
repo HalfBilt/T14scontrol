@@ -665,12 +665,15 @@ class Hud(object):
         self.buf_size = (wid, hei)
 
     def free_buffers(self):
+        # ★2026-10-22 修静默崩溃: 位图还选在 DC 里就 DeleteObject 属于未定义行为,
+        #   GDI 会"延迟删除", 之后同一 DC 再画/再换图就可能访问违例 —— 表现为进程无声消失、
+        #   没有 Python traceback。正确顺序: 先 DeleteDC(自动取消选择) 再 DeleteObject。
         for dc, dib in ((self.memdc, self.dib), (self.tmemdc, self.tdib),
                         (self.smemdc, self.sdib)):
-            if dib:
-                gdi32.DeleteObject(dib)
             if dc:
                 gdi32.DeleteDC(dc)
+            if dib:
+                gdi32.DeleteObject(dib)
         self.memdc = self.dib = self.bits = None
         self.tmemdc = self.tdib = self.tbits = None
         self.smemdc = self.sdib = self.sbits = None
@@ -678,6 +681,12 @@ class Hud(object):
 
     # ---- 建窗
     def create(self):
+        try:
+            p = os.path.join(BASE, 'quit.flag')
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
         wc = WNDCLASSEXW()
         wc.cbSize = ctypes.sizeof(wc)
         wc.lpfnWndProc = self.wndproc_ref
@@ -702,6 +711,7 @@ class Hud(object):
         user32.SetTimer(self.hwnd, 1, 1000, None)
         self.apply_lock()
         self.start_toggle_thread()
+        self._dbg('started pid=%d' % os.getpid())
         self.refresh()
 
     # ---- 合成 + 上屏
@@ -1165,6 +1175,12 @@ class Hud(object):
             save_cfg(self.cfg)
             self.refresh()
         elif cmd == 400:
+            # 记下"是用户主动退出的"，看门狗看到就不自动拉起
+            try:
+                open(os.path.join(BASE, 'quit.flag'), 'w').write(time.strftime('%Y-%m-%d %H:%M:%S'))
+            except Exception:
+                pass
+            self._dbg('quit by menu')
             user32.DestroyWindow(self.hwnd)
 
     def _wndproc(self, hwnd, msg, wparam, lparam):

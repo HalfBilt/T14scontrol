@@ -1,6 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+if exist "%~dp0quit.flag" del /q "%~dp0quit.flag"
 set "PYW=%~dp0..\runtime\pythonw.exe"
 if not exist "%PYW%" (
     echo [错误] 找不到共用运行时: %PYW%
