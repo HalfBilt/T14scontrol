@@ -74,6 +74,26 @@ EC_CPU_TMP = 0x78
 # ★0x31(HUWB/VPON/VRST) **不要写** —— 老 IBM/X60 那代才是 fan select。
 #   本机实测写 0 和不写, 读到的转速一模一样, 但 VPON/VRST 位会被清掉。
 
+# ---- HFSP(0x2F) 的合法编码 + 健全性校验 -----------------------------------
+# ★2026-10-23: 0x2F 只有下面这几种合法编码。**别的值一律是碰撞读出来的脏数据**,
+#   不是"固件写进来的奇怪档位"。
+#   证据(2026-10-23 复核): 日志里 72 次"HFSP 被固件改成更弱的值", 读到的分别是
+#     0x20 0x2C 0x2E 0x30 0x31 0x32 0x33 0x35 0x54 0x90
+#   而 0x20=32°C / 0x2C=44 / 0x2E=46 / 0x30=48 / 0x31=49 / 0x32=50 / 0x33=51 /
+#   0x35=53 / 0x54=84 —— **全部落在温度区间**, 就是 EC 0x78/0x7A 那一带的读数。
+#   决定性反证: 2026-10-22 04:54~08:20 连续 5 次"被改成 0x20"(档位 0 = 停转),
+#     而这整段时间 RPM 稳在 2473→2479, 风扇**根本没停**; 23:06 那次同样,
+#     22:51 RPM=2469 -> 23:26 RPM=2466。固件没改档位, 是我们读串了。
+#   为什么哨兵没挡住: ec_read_strict 是"哨兵-目标-哨兵"**三笔独立事务**, 而碰撞是
+#     按事务随机的 —— 只有中间那笔被撞、前后哨兵都干净时, 它完全看不出来。
+#     对 0x2F 这种慢变量, "连读两次必须一致"才是有效校验(见 hfsp_read)。
+HFSP_VALID = frozenset([0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x40, 0x80])
+
+
+def hfsp_sane(v):
+    """0x2F 的读数是否可能是真的(滤掉碰撞读出的温度字节)。"""
+    return v is not None and v in HFSP_VALID
+
 # ---- MSR (官方 IntelMSR 模块的读白名单里都有, 只能读不能写这些) ----------
 MSR_TJMAX        = 0x1A2   # IA32_TEMPERATURE_TARGET, bits 23:16 = TjMax
 MSR_THERM_STATUS = 0x1B1   # IA32_PACKAGE_THERM_STATUS, bits 22:16 = 距 TjMax 的余量
@@ -224,6 +244,56 @@ class TSCtlBackend(object):
     def set_fan(self, level):
         """写 HFSP(0x2F)。★不写 0x31(它不是 FANSW, 写它会清 VPON/VRST, 转速也不变)。"""
         return self.ec_write(EC_FAN, level)
+
+    def hfsp_read(self):
+        """读 0x2F 并做健全性校验; 两次不一致 / 非法编码都返回 None。
+
+        ★2026-10-23: 换掉 ec_read_fast(ec_read_strict tries=1)。那套"哨兵-目标-哨兵"
+          要 3 笔事务, 却挡不住"只有中间那笔被撞"的情况(碰撞按事务随机发生)。
+          0x2F 是慢变量, 用 ec_read_ok(tries=2) 的"连读两次一致"更有效,
+          而且只要 2 笔事务 —— 比原来更省总线。
+          再叠一道 hfsp_sane: 不是合法编码的值一律当读失败, 绝不用它去重写档位
+          (那 72 次"固件抢档"的假警报就是这么来的)。
+        """
+        try:
+            v = self._cpf.ec_read_ok(EC_FAN, tries=2)
+        except Exception:
+            return None
+        return v if hfsp_sane(v) else None
+
+    def tz_temp(self):
+        """ACPI 热区温度(°C)。不占 EC 总线; 不可用时返回 None。"""
+        try:
+            return self._cpf.tz_temp()
+        except Exception:
+            return None
+
+    def uptime(self):
+        """系统清醒运行秒数; 拿不到返回 -1。"""
+        try:
+            u = self._cpf.unbiased_uptime()
+            if u is None:
+                u = self._cpf.uptime()
+            return float(u)
+        except Exception:
+            return -1.0
+
+    def boot_quiet(self):
+        """开机静默窗口内返回 True —— 此时不要碰 EC 总线。
+
+        ★2026-10-23: 机制保留但**当前关闭**(CpuPLFix.EC_BOOT_QUIET_S = 0)。
+          实测过 30 秒窗口: 事件 15 只是从开机第 14 秒推迟到第 31 秒, 数量不变 ——
+          无效, 所以关掉, 免得白白让开机头 30 秒跑更弱的原生曲线。
+        这里先判 <=0 再返回: 关闭时不做 QueryUnbiasedInterruptTime 那次系统调用,
+          免得每个决策节拍都白跑一次。
+        """
+        try:
+            q = float(self._cpf.EC_BOOT_QUIET_S)
+            if q <= 0:
+                return False
+            return 0.0 <= self.uptime() < q
+        except Exception:
+            return False
 
     def rpm(self):
         # 转速只用于显示: 用较轻的一致性读(每寄存器 2 笔), 不用 9 笔的 strict ——
@@ -572,6 +642,7 @@ class FanController(object):
         self._last_reason = ""          # 上次拉满的原因(给日志/托盘)
         # EC 采样缓存(决策 2 秒一次, EC 仍按 cycle_sec 轮询)
         self._ec_temp = None
+        self._ec_src = None             # 温度来源: "TZ"(ACPI 热区) / "EC"(裸读 0x78)
         self._ec_t = 0.0
         self._ec_temp_t = 0.0           # 最近一次**读成功**的时间(HUD 判断温度是否陈旧)
         self._ec_bad = 0
@@ -680,6 +751,16 @@ class FanController(object):
         # ★2026-10-20: 只剩 TSCtl 一个后端(PawnIO 已删: 它拒绝 SYSTEM 账户)
         self.ec = TSCtlBackend()
         self.say("EC 通道就绪 (TSCtl, 与 CPU 侧同一驱动/同一把锁)")
+        # ★2026-10-23: 明确报一次温度来源。
+        #   日志里的 "EC=xx°C" 现在可能来自 ACPI 热区(正常情况下), 也可能是热区不可用时的
+        #   EC 0x78 裸读 —— 两者读数差 1~2°C, 但排查时意义完全不同(裸读意味着又在抢总线)。
+        try:
+            _tz = self.ec.tz_temp()
+            self.say("温度来源: %s" % (
+                "ACPI 热区 \\_TZ.THM0 (不占 EC 总线)"
+                if _tz is not None else "EC 0x78 裸读 (热区不可用, 会与 ACPI 抢总线)"))
+        except Exception:
+            pass
         msr_backend = self.ec
         # DTS 通道: 打不开也不影响风扇主功能
         try:
@@ -692,25 +773,47 @@ class FanController(object):
             self.msr = None
             self.say("DTS 通道不可用 (%s) —— 只靠 EC 温度与负载前馈" % exc)
 
+    def _boot_quiet(self):
+        """开机静默窗口内返回 True —— 一律不主动碰 EC 总线。
+
+        ★2026-10-23: 实测开机第 14 秒两个服务同时访问 EC, 而 ACPI 驱动还在做启动
+          初始化(热区/电池/DPTF), 固定爆 5 条事件 15。这 30 秒内风扇交给 EC 原生曲线,
+          和"服务还没起来"完全一样, 不是失控; 决策仍靠 DTS(MSR, 不占 EC) 正常进行。
+        """
+        try:
+            return self.ec.boot_quiet()
+        except Exception:
+            return False
+
     def _ec_poll(self, now):
-        """按 cycle_sec 节流读 EC 温度; 转速每 6 次 EC 读一次(约 30 秒).
+        """按 cycle_sec 节流取温度; 转速每 6 次 EC 读一次(约 30 秒).
+
+        ★2026-10-23: 温度改走 ACPI 热区(PDH, 零 EC 总线占用), 拿不到才退回裸读 0x78。
+          原因: EC 0x78 正是 \\_TZ.THM0._TMP 要读的寄存器, 抢它的终点是
+          "ACPI 拿不到温度 -> 固件报 _HOT -> 强制休眠"(2026-10-18 已发生过一次)。
+          热区读数与 0x78 偏差 1~2°C, 滞后 1~3 秒; 提前量由 DTS 负责, 够用。
 
         ★EC 0x78 偶发返回越界值(2026-10-20 实测读到 132°C), 必须丢弃:
           一个假的高温会误触发 88°C 失效保护, 把风扇莫名钉到满速。
           有效范围取 0~127。
         """
+        if self._boot_quiet():
+            return self._ec_temp, self._rpm
         if self._ec_temp is None or now - self._ec_t >= self._ec_cycle:
-            try:
-                raw = self.ec.ec_read_fast(EC_CPU_TMP)
-            except Exception as exc:
-                self._ec_bad += 1
-                if self._ec_bad in (1, 10) or self._ec_bad % 60 == 0:
-                    self.say("EC 温度读取失败 %s (连续第 %d 次)" % (exc, self._ec_bad))
-                raw = None
+            raw = self.ec.tz_temp()
+            self._ec_src = "TZ" if raw is not None else "EC"
+            if raw is None:
+                try:
+                    raw = self.ec.ec_read_fast(EC_CPU_TMP)
+                except Exception as exc:
+                    self._ec_bad += 1
+                    if self._ec_bad in (1, 10) or self._ec_bad % 60 == 0:
+                        self.say("EC 温度读取失败 %s (连续第 %d 次)" % (exc, self._ec_bad))
+                    raw = None
             if ec_temp_ok(raw):
                 if self._ec_bad:
-                    self.say("EC 温度恢复正常 %d°C (此前连续异常 %d 次)"
-                             % (raw, self._ec_bad))
+                    self.say("EC 温度恢复正常 %d°C (此前连续异常 %d 次, 当前来源 %s)"
+                             % (raw, self._ec_bad, self._ec_src))
                 self._ec_temp = raw
                 self._ec_temp_t = now
                 self._ec_bad = 0
@@ -750,13 +853,17 @@ class FanController(object):
         """
         if want is None or self.current_hfsp is None:
             return False
-        try:
-            real = self.ec.ec_read_fast(EC_FAN)
-        except Exception:
+        if self._boot_quiet():
             return False
-        if real is None or real == want:
-            if real is not None:
-                self.current_hfsp = real
+        # ★2026-10-23: 改用 hfsp_read(两次一致 + 合法编码校验)。
+        #   以前这里用 ec_read_fast, 把碰撞读到的温度字节(0x20/0x31/0x54…)当成
+        #   "固件把档位改弱了", 于是重写了 72 次 —— 每次还要多 2 笔 EC 事务,
+        #   纯属自己给自己制造总线流量。读不准就当这一拍没看到。
+        real = self.ec.hfsp_read()
+        if real is None:
+            return False
+        if real == want:
+            self.current_hfsp = real
             return False
         # ★只防"变弱": 固件给的档位 >= 我们要的 -> 接受(它在帮我们降温, 别拉锯);
         #   固件给的 < 我们要的 -> 立刻重写(挡住"固件把风扇按到最低档")。
@@ -1034,7 +1141,12 @@ class FanController(object):
                     # ③ 驻留：只压"降档"，且温度仍在当前档触发点附近才压
                     #    ★2026-10-21 修: 原来驻留是 elif 链的一环, 只要前馈分支命中就不判断,
                     #      导致"负载抬档后想压回去"可以绕过 60 秒驻留(实测 2 秒就来回一次)。
-                    if (target < self.current_hfsp
+                    #    ★2026-10-23 修: 必须显式判 current_hfsp is not None ——
+                    #      读档位失败/开机静默窗口期间它是 None, 而 None 参与 `<` 比较会抛
+                    #      "'<' not supported between instances of 'int' and 'NoneType'",
+                    #      实测导致决策循环每 2 秒报一次 "EC 写入异常"。
+                    if (self.current_hfsp is not None
+                            and target < self.current_hfsp
                             and self.current_hfsp in LEVEL_RPM
                             and dwell > 0 and (now - self._last_change) < dwell
                             and dwell_hold(t_ctrl, curve, self.current_hfsp,
@@ -1112,6 +1224,8 @@ class FanController(object):
         ★2026-10-20: 固件会抢 0x2F, 所以写完**立刻回读一次**确认落到目标档;
         没落到就再写一次(最多 2 次) —— 只写不管的话, 实际转速由固件曲线说了算。
         """
+        if self._boot_quiet():
+            return                      # 开机静默窗口: 不碰 EC(见 _boot_quiet)
         wrote = False
         for attempt in (1, 2):
             try:
@@ -1123,10 +1237,8 @@ class FanController(object):
                 self.say("写档位 0x%02X 没被 EC 确认, 下一拍再试" % level)
                 break
             wrote = True
-            try:
-                real = self.ec.ec_read_fast(EC_FAN)
-            except Exception:
-                real = None
+            # ★2026-10-23: 回读用 hfsp_read(两次一致 + 合法编码), 避免拿脏值判"没落到目标"
+            real = self.ec.hfsp_read()
             if real is None or real == level:
                 break
             self.say("档位没落到目标: 写 0x%02X 回读 0x%02X, 重试" % (level, real))
@@ -1136,10 +1248,10 @@ class FanController(object):
             self._rpm_fast_until = now + 35.0
 
     def _read_hfsp(self):
-        try:
-            v = self.ec.ec_read_fast(EC_FAN)
-        except Exception:
-            return None
+        if self._boot_quiet():
+            return None                 # 开机静默窗口: 不碰 EC(见 _boot_quiet)
+        # ★2026-10-23: hfsp_read(两次一致 + 合法编码), 脏值不再污染 current_hfsp
+        v = self.ec.hfsp_read()
         if v is not None:
             self.current_hfsp = v
         return v
