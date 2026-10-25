@@ -1,0 +1,16 @@
+# 运行时生成的本地文件
+config.json
+config.json.broken
+fan_control.log
+fan_control.log.*
+__pycache__/
+build/
+dist/
+*.pyc
+
+# 本地备份（时间戳后缀，不进仓库）
+*.bak-*
+
+# 捆绑的 Python 运行时（46MB，不进仓库；由部署时复制）
+runtime/
+fan_service.log
