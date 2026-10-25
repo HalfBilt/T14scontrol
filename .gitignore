@@ -1,0 +1,19 @@
+# ---- 运行时生成（不进仓库）----
+runtime/
+status/
+logs/
+__pycache__/
+*.pyc
+
+# ---- 日志 ----
+*.log
+*.log.*
+
+# ---- 本地备份 ----
+*.bak-*
+*.bak
+*.broken
+
+# ---- HUD 标记 / 临时输出 ----
+quit.flag
+dev/ec_scan_out.txt

@@ -1,5 +1,5 @@
 # 运行时生成的本地文件
-config.json
+# config.json 自 2026-10-25 起纳入跟踪（风扇曲线/阈值/驻留，换机器不想重调）
 config.json.broken
 fan_control.log
 fan_control.log.*
