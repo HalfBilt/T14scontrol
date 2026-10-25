@@ -49,7 +49,12 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(BASE, 'config.json')
 LOG_DIR = os.path.join(BASE, 'logs')
 SYS_SRC = os.path.join(BASE, 'TSCtl.sys')
-SYS_DST = os.path.join(BASE, 'TSCtl.sys')
+# ★2026-10-23: 驱动优先用系统驱动目录那份 —— %APPDATA% 是普通用户可写的, 而这份 .sys
+#   由 SYSTEM 服务在开机时加载, 等于"任何以当前用户身份跑的进程都能改内核代码"。
+#   系统目录那份不存在时自动退回本目录(和原来行为一致, 不会因为没提升权限就跑不起来)。
+_SYS_DRV = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'),
+                        'System32', 'drivers', 'TSCtl.sys')
+SYS_DST = _SYS_DRV if os.path.isfile(_SYS_DRV) else os.path.join(BASE, 'TSCtl.sys')
 SVC = 'TSCtl'
 SVC_TOOL = 'CpuPLFixSvc'
 TASK_NAME = 'CpuPLFix'
@@ -342,6 +347,7 @@ def elevate():
 
 # ---------------------------------------------------------------- 驱动
 _handle = None
+_drv_checked = False        # ★2026-10-23: 驱动路径是否已校正过(每进程只做一次)
 
 
 def _extract_driver_from_exe(exe_path, out_path):
@@ -390,10 +396,41 @@ def _extract_driver_from_exe(exe_path, out_path):
 
 
 def ensure_driver_file():
-    """确保 TSCtl.sys 存在; 没有就从本机 ThrottleStop.exe 里提取"""
-    if os.path.exists(SYS_DST):
+    """确保驱动文件在**系统驱动目录**里; 拿不到就退回复用本目录那份。
+
+    ★2026-10-23 重排顺序(原来是"目标存在 -> 全盘 glob ThrottleStop.exe"):
+      ① 系统目录已有 -> 直接用;
+      ② 本目录有现成的 -> 复制到系统目录(服务以 SYSTEM 身份跑, 能写); 写不进去
+         (比如命令行非管理员)就退回复用本目录那份, 绝不阻断加载;
+      ③ 两处都没有 -> 才去从 ThrottleStop.exe 提取。
+      改这个是因为 SYS_DST 现在优先指向 System32: 万一那份被删了, 老顺序会跳过
+      本目录已有的 TSCtl.sys, 直接 glob C:\\ 下两层找 ThrottleStop.exe —— 开机早期
+      那一步可能卡几十秒。现在先看本目录, 有就直接复制过去, 顺便让"驱动搬家"变成
+      每次服务启动都会自愈的动作。
+    """
+    global SYS_DST
+
+    # ① 系统目录已有
+    if os.path.isfile(_SYS_DRV):
+        SYS_DST = _SYS_DRV
         return True
 
+    # ② 本目录有现成的 -> 提升到系统目录
+    local = os.path.join(BASE, 'TSCtl.sys')
+    if os.path.isfile(local):
+        try:
+            import shutil
+            shutil.copy2(local, _SYS_DRV)
+        except Exception:
+            pass
+        if os.path.isfile(_SYS_DRV):
+            SYS_DST = _SYS_DRV
+        else:
+            SYS_DST = local
+            out('[*] 无法写入系统驱动目录, 改用本目录的 TSCtl.sys')
+        return True
+
+    # ③ 都没有 -> 从 ThrottleStop.exe 提取
     import glob
     cands = [os.path.join(BASE, 'ThrottleStop.exe')]
     roots = [os.path.join(os.path.expanduser('~'), 'Desktop'),
@@ -457,6 +494,8 @@ SC_MANAGER_CREATE_SERVICE = 0x0002
 SERVICE_QUERY_STATUS = 0x0004
 SERVICE_START = 0x0010
 SERVICE_STOP = 0x0020
+SERVICE_CHANGE_CONFIG = 0x0002      # ★2026-10-23: 改服务登记信息用
+SERVICE_NO_CHANGE = 0xFFFFFFFF
 SERVICE_RUNNING = 4
 SERVICE_ALL_ACCESS = 0xF01FF
 DELETE = 0x00010000
@@ -474,6 +513,10 @@ adv.CreateServiceW.argtypes = [w.HANDLE, w.LPCWSTR, w.LPCWSTR, w.DWORD, w.DWORD,
                                w.LPCWSTR, w.LPCWSTR, w.LPCWSTR]
 adv.DeleteService.argtypes = [w.HANDLE]
 adv.ControlService.argtypes = [w.HANDLE, w.DWORD, ctypes.c_void_p]
+adv.ChangeServiceConfigW.restype = w.BOOL
+adv.ChangeServiceConfigW.argtypes = [w.HANDLE, w.DWORD, w.DWORD, w.DWORD, w.LPCWSTR,
+                                     w.LPCWSTR, ctypes.POINTER(w.DWORD), w.LPCWSTR,
+                                     w.LPCWSTR, w.LPCWSTR, w.LPCWSTR]
 
 
 def svc_create(name, binpath, display, svc_type, start_type, error_control):
@@ -565,6 +608,68 @@ def svc_start(name):
         adv.CloseServiceHandle(hscm)
 
 
+def _driver_binpath():
+    """读服务注册表里登记的驱动镜像路径(ImagePath); 读不到返回 None。"""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r'SYSTEM\CurrentControlSet\Services\%s' % SVC) as k:
+            v, _t = winreg.QueryValueEx(k, 'ImagePath')
+            return v
+    except Exception:
+        return None
+
+
+def _norm_winpath(p):
+    """把 ImagePath 的各种写法(\\??\\C:\\... / \\SystemRoot\\...)归一成小写全路径。"""
+    if not p:
+        return ''
+    s = p.strip().strip('"')
+    root = os.environ.get('SystemRoot', r'C:\Windows')
+    if s.lower().startswith('\\??\\'):
+        s = s[4:]
+    elif s.lower().startswith('\\systemroot\\'):
+        s = os.path.join(root, s[len('\\SystemRoot\\'):])
+    return os.path.normcase(os.path.normpath(s))
+
+
+def _set_driver_image_path(image):
+    """改服务登记的驱动镜像路径(走 SCM API, 不 spawn sc.exe)。成功返回 True。"""
+    hsc = adv.OpenSCManagerW(None, None, SC_MANAGER_CONNECT)
+    if not hsc:
+        return False
+    try:
+        h = adv.OpenServiceW(hsc, SVC, SERVICE_CHANGE_CONFIG)
+        if not h:
+            return False
+        try:
+            return bool(adv.ChangeServiceConfigW(
+                h, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE,
+                image, None, None, None, None, None, None))
+        finally:
+            adv.CloseServiceHandle(h)
+    finally:
+        adv.CloseServiceHandle(hsc)
+
+
+def _fix_driver_path():
+    """服务登记的驱动路径和我们要用的那份不一致时, 改回我们这份。
+
+    ★2026-10-23 —— 这就是"改了一份不生效"的根源:
+      服务只在**不存在**时创建, 之后永远用最初登记的那个路径。实测本机 TSCtl 指向
+      %APPDATA%\\CpuPLFix\\TSCtl.sys, 而两个服务跑的代码在 %APPDATA%\\T14scontrol\\ 下 ——
+      驱动和代码分属两套目录, 改哪一份都可能不生效。
+    安全边界: 只在**目标文件确实存在**时才改; 改不动就静默放弃(绝不阻断加载)。
+      已经加载进内核的镜像不受影响, 新路径从下次启动开始生效。
+    """
+    cur = _driver_binpath()
+    if not cur or not os.path.isfile(SYS_DST):
+        return False
+    if _norm_winpath(cur) == _norm_winpath(SYS_DST):
+        return False
+    return _set_driver_image_path('\\??\\' + SYS_DST)
+
+
 def ensure_driver(verbose=True):
     """确保驱动服务已加载, 返回设备句柄"""
     global _handle
@@ -588,6 +693,19 @@ def ensure_driver(verbose=True):
             ok, msg = (rc == 0), txt.strip()[:120]
         if verbose:
             out('[*] 创建驱动服务: %s' % ('成功' if ok else msg))
+    else:
+        # ★2026-10-23: 服务已存在时校正驱动路径(只在本进程第一次走到这里时做一次)。
+        #   不校正的话, 服务永远用最初登记的路径 —— 改了代码却不生效就是这个原因。
+        global _drv_checked
+        if not _drv_checked:
+            _drv_checked = True
+            try:
+                # 先保证驱动文件在系统目录(被删了就自动从本目录补回去), 再校正服务登记的路径
+                ensure_driver_file()
+                if _fix_driver_path() and verbose:
+                    out('[*] 驱动路径已校正为: %s' % SYS_DST)
+            except Exception:
+                pass
 
     svc_start(SVC)
 
@@ -784,7 +902,79 @@ def _ec_drain():
         time.sleep(0.001)
 
 
-EC_OBF_GIVEUP = 5      # OBF 连续挂这么多轮才认作自己的残留(见 _ec_obf_gate)
+def _ec_abort_drain():
+    """事务中途放弃后, 把 EC 输出缓冲里那一格吃掉。
+
+    ★2026-10-23 —— 这是 ACPI 事件 15 的真凶, 有 1:1 的时序证据:
+      发出命令 0x80 之后, EC 一定会把结果放进输出缓冲并置 OBF。如果我们因为
+      超时/端口写失败直接 return, 就没有人来取这个字节, OBF 会一直挂着。
+      系统 ACPI EC 驱动下一次访问看到"没有请求却有数据"(事件 15),
+      或者干脆把这条残留当成自己的应答(事件 13, 读到的值也是错的)。
+
+      日志实证: 每次风扇服务启动的**同一秒**固定爆 5 条事件 15,
+      10-20 之后的 8 次爆发全部命中服务启动 —— 就是启动路径上
+      "接管即摆正档位"那笔事务在 250ms 锁超时后被放弃留下的脏字节。
+
+      代价: 最多 8 次端口读, 而且只发生在**本来就已经失败**的那一笔上。
+      对比: 不清理的代价是 OBF 挂着 4 轮(EC_OBF_GIVEUP) ≈ 十几秒的脏总线。
+    """
+    try:
+        _ec_drain()
+    except Exception:
+        pass
+
+
+_EC_FIRST_TOUCH_DONE = False
+
+
+def _ec_first_touch():
+    """冷启动后第一次上总线之前, 把"上电遗留的 OBF 字节"清掉(每进程只做一次)。
+
+    ★2026-10-23 现象(两次开机复现):
+        08:47:07 开机第 14 秒 —— 第一笔裸 EC 事务的同一秒爆 5 条事件 15
+        08:55:00 开机第 31 秒 —— 同样 5 条(把首次访问推迟到 30 秒也没用)
+      而"服务重启、系统已运行数小时"(08:07)是 **0 条**。
+      → 是**冷启动遗留状态**, 不是"ACPI 当时正忙"; 推迟访问无效, 必须把它清掉。
+
+    怎么区分"遗留"和"ACPI 正在等的数据"(这条最关键, 抢错就会换来事件 13):
+      连续 3 次读状态口、间隔 20ms, 都看到 OBF 置位 —— 即该字节已在缓冲里挂了 60ms。
+      ACPI 的一笔 EC 事务是微秒级, 不可能让一个字节挂 60ms; 所以 60ms 还赖着不走,
+      基本可以断定是固件/上电遗留。反之只要读到一次 OBF 已清零, 立刻收手, 什么都不动。
+
+    只在每进程第一笔事务前跑一次; 任何异常都不阻断后续。
+    """
+    global _EC_FIRST_TOUCH_DONE
+    if _EC_FIRST_TOUCH_DONE:
+        return
+    _EC_FIRST_TOUCH_DONE = True
+    try:
+        seq = []
+        stuck = 0
+        for _ in range(6):
+            st = rd_port(EC_CTRL)
+            seq.append('--' if st is None else '%02X' % st)
+            if st is not None and (st & 0x01):
+                stuck += 1
+                if stuck >= 3:                     # 挂了 >=60ms -> 判为遗留
+                    _ec_drain()
+                    _ECBUS['obf_busy'] = 0
+                    _ECBUS['first_drain'] = _ECBUS.get('first_drain', 0) + 1
+                    out('[首次访问] OBF 连续置位 %d 次(>=60ms), 判为冷启动遗留已清掉 | 状态序列: %s'
+                        % (stuck, ' '.join(seq)))
+                    return
+            else:
+                out('[首次访问] EC 状态干净, 未干预 | 状态序列: %s' % ' '.join(seq))
+                return
+            time.sleep(0.02)
+        out('[首次访问] 状态不稳定, 交给正常流程 | 状态序列: %s' % ' '.join(seq))
+    except Exception:
+        pass
+
+
+EC_OBF_GIVEUP = 2      # OBF 连续挂这么多轮才认作自己的残留(见 _ec_obf_gate)
+# ★2026-10-23: 5 -> 2。既然 ec_read 事务中途放弃时会自己把那个字节吃掉
+#   (见 _ec_abort_drain), 就不需要靠"连续 5 轮"来区分"自己的残字节"了。
+#   留 2 轮只是为了不和 ACPI.sys 正在等的那一笔抢。
 
 
 def _ec_obf_gate():
@@ -1012,7 +1202,14 @@ def ec_read(off, _locked=False, delay=0.003):
     #   (固件标志)才会计 —— 温度/档位那些普通读一次都不计, 于是那个"串位率"既不是
     #   事务级、也没覆盖真正喂风扇曲线的那几笔。现在按**事务**计数, 分母才稳。
     _ECBUS['tx'] = _ECBUS.get('tx', 0) + 1
+    # ★2026-10-23: 命令 0x80 一旦发出去, EC 必定产出 1 个字节 —— 必须有人吃掉它。
+    #   下面任何一个中途 return 都要在 finally 里补一次 drain(见 _ec_abort_drain),
+    #   否则 OBF 一直挂着 -> ACPI.sys 记事件 15(服务每次启动固定 5 条)。
+    cmd_issued = False
+    consumed = False
     try:
+        # ★2026-10-23: 冷启动后第一笔事务前先"清场"(见 _ec_first_touch)
+        _ec_first_touch()
         # ★2026-10-20(12:31:49 凉机强制休眠): 不再无条件 _ec_drain()。
         #   输出缓冲里挂着的字节多半是**系统 ACPI EC 驱动(_TMP)正在等**的数据;
         #   我们读走它 -> 对方超时(系统日志 ACPI 事件 13) -> DSDT 的 _TMP 拿到失败值
@@ -1025,6 +1222,7 @@ def ec_read(off, _locked=False, delay=0.003):
         if not wr_port(EC_CTRL, 0x80):      # ★2026-10-19: 原来丢掉返回值 —— 写失败也照样往下走
             ec_bus_stat(True)
             return _ec_fail()
+        cmd_issued = True                   # ★2026-10-23: 从这一刻起 EC 一定会产出 1 个字节
         if not _ec_wait(False):
             return _ec_fail()
         if not wr_port(EC_DATA, off):
@@ -1042,8 +1240,11 @@ def ec_read(off, _locked=False, delay=0.003):
         if v is None:
             ec_bus_stat(True)
             return _ec_fail()
+        consumed = True
         return v
     finally:
+        if cmd_issued and not consumed:
+            _ec_abort_drain()
         if not _locked:
             _ec_unlock(locked)
 
@@ -1244,10 +1445,51 @@ def ec_read_strict(off, tries=3):
     return None
 
 
+EC_WRITE_WAIT_S = 2.0      # ★写事务的 IBF 等待上限(秒) —— 不受风扇服务那个 0.2s 影响
+
+# 开机静默窗口(秒) —— 系统起来后这么久之内不主动碰 EC 总线。**实测无效, 已关闭(0)**。
+#
+# 为什么加: 2026-10-23 08:47 开机第 14 秒两个服务同时上总线, 爆了 5 条事件 15,
+#   当时猜是撞上 ACPI 的启动初始化, 于是把首次访问推到 30 秒之后。
+# 实测结果(08:55 那次开机): 事件 15 变成在 **08:55:00(开机第 31 秒)** 爆, 还是 5 条 ——
+#   也就是"静默窗口"只是把爆发点往后推, 没消除它。
+# 结论: 爆发与"ACPI 忙不忙"无关, 而是**冷启动后的第一笔裸 EC 事务**本身就会让它出现
+#   (08:07 那次服务重启、系统已运行数小时 -> 0 条, 可以作为对照)。
+# 既然无效, 就关掉 —— 留着只会让开机头 30 秒的风扇交给原生曲线(更弱的曲线), 白亏。
+# 保留这套机制(0 即关闭), 万一以后定位到别的成因可以直接调大。
+EC_BOOT_QUIET_S = 0.0
+
+
+def _ec_finish_write(off, val):
+    """写事务卡住时, 尽力把它走完(把偏移和数据都推过去)。
+
+    宁可把**我们自己本来就要写的值**写进去, 也不能让 EC 停在"等偏移/等数据"状态 ——
+    那会让下一个字节(很可能是 ACPI.sys 的)被当成本笔的剩余字节, 写进随机寄存器。
+    """
+    _ECBUS['wr_stuck'] = _ECBUS.get('wr_stuck', 0) + 1
+    try:
+        wr_port(EC_DATA, off & 0xFF)
+        _ec_wait(False, 0.05)
+        wr_port(EC_DATA, val & 0xFF)
+        _ec_wait(False, 0.05)
+    except Exception:
+        pass
+
+
 def ec_write(off, val, _locked=False):
-    """写一个 EC 寄存器"""
+    """写一个 EC 寄存器。
+
+    ★2026-10-23: 发出 0x81 之后**绝不能用 0.2 秒的短超时半途放弃**。
+      ACPI EC 的写协议是"0x81 -> 偏移 -> 数据"三步。中途撒手会让 EC 的状态机停在
+      "等偏移/等数据", 之后任何人写 0x62 的第一个字节都会被当成我们这笔的剩余字节 ——
+      那是真正的协议错位(可能把垃圾写进随机寄存器), 比慢一点危险得多。
+      所以: 命令发出前用短超时(拿不到就干净地不开始); 命令发出后用 2 秒的宽松上限,
+      而且真卡住了也要把剩余字节推完(_ec_finish_write)。
+      写只在换档时发生(实测 ≥90 秒一次), 放宽到 2 秒对控制循环毫无影响。
+    """
     locked = _ec_lock() if not _locked else True
     try:
+        _ec_first_touch()                    # ★2026-10-23: 冷启动第一次写之前也先清场
         # 和读路径同一道门: OBF 挂着时先不写, 更不要 drain —— 那可能是 ACPI 的字节。
         if not _ec_obf_gate():
             return False
@@ -1255,15 +1497,21 @@ def ec_write(off, val, _locked=False):
             return False
         if not wr_port(EC_CTRL, 0x81):       # ★2026-10-19: 原来丢掉返回值, 写失败也返回 True
             return False
-        if not _ec_wait(False):
+        # ★2026-10-23: 从这一刻起 EC 在等"偏移+数据", 任何 return 前都必须走完/推完
+        if not _ec_wait(False, EC_WRITE_WAIT_S):
+            _ec_finish_write(off, val)
             return False
         if not wr_port(EC_DATA, off):
+            _ec_finish_write(off, val)
             return False
-        if not _ec_wait(False):
+        if not _ec_wait(False, EC_WRITE_WAIT_S):
+            _ec_finish_write(off, val)
             return False
         if not wr_port(EC_DATA, val):
+            _ec_finish_write(off, val)
             return False
-        if not _ec_wait(False):
+        if not _ec_wait(False, EC_WRITE_WAIT_S):
+            # 数据字节已经写进去了, 不要再推一遍(会多出一个游离字节)
             return False
         return True
     finally:
@@ -1271,11 +1519,127 @@ def ec_write(off, val, _locked=False):
             _ec_unlock(locked)
 
 
+# ---------------------------------------------------------------- ACPI 热区温度通道
+# ★2026-10-23: 温度改走 ACPI 热区(PDH 计数器), 正常情况下不再裸读 EC 0x78。
+#
+#   为什么必须换: EC 0x78 正是 \_TZ.THM0._TMP 要读的那个寄存器。我们每读一次 0x78,
+#   就是在和系统 ACPI EC 驱动抢同一笔事务。抢赢的代价是 _TMP 拿到失败值 -> 固件报
+#   _HOT -> 强制休眠(2026-10-18 那次凉机休眠就是这么来的)。
+#   而 PDH 的 "\Thermal Zone Information(\_TZ.THM0)\High Precision Temperature"
+#   由 ACPI 驱动自己求值 _TMP —— **整笔 EC 事务都在 ACPI 自己的仲裁里完成**,
+#   我们只是读它算好的结果, 对 EC 总线零占用、零竞争。
+#
+#   实测(2026-10-23): 与 EC 0x78 偏差 1~2°C(热区是整数刻度), 滞后 1~3 秒。
+#   DTS(MSR 0x1B1)仍然负责提前量, EC 温度只用于定稳态档位, 这个精度完全够。
+#   纯 ctypes + pdh.dll, 不依赖任何第三方包; 拿不到就自动退回裸读 EC(见 ec_temp)。
+TZ_COUNTER_PATH = r'\Thermal Zone Information(\_TZ.THM0)\High Precision Temperature'
+TZ_TEMP_LO, TZ_TEMP_HI = 0, 127      # 与 EC 0x78 同一量纲 / 同一有效范围
+TZ_MAX_FAIL = 3                      # 连续失败几次就临时放弃这条通道
+TZ_RETRY_AFTER_S = 60.0              # 放弃后多久再试(期间直接用 EC 裸读)
+# ★2026-10-23: 300 -> 60。热区通道一旦被"连续 3 次失败"判死, 这期间温度就退回裸读
+#   EC 0x78 —— 那正是我们费力消灭掉的那条抢总线的路径。开机早期 PDH 还没就绪时
+#   偶发几次失败很正常, 让这个惩罚持续 5 分钟太狠了。60 秒足够避开抖动,
+#   而重试成本只是一次 PdhCollectQueryData。
+PDH_FMT_DOUBLE = 0x00000200
+
+
+class _PDH_FMT_COUNTERVALUE(ctypes.Structure):
+    class _U(ctypes.Union):
+        _fields_ = [('longValue', ctypes.c_long),
+                    ('doubleValue', ctypes.c_double),
+                    ('largeValue', ctypes.c_longlong),
+                    ('AnsiStringValue', ctypes.c_char_p),
+                    ('WideStringValue', ctypes.c_wchar_p)]
+    _anonymous_ = ('u',)
+    _fields_ = [('CStatus', ctypes.c_ulong), ('u', _U)]
+
+
+_tz = {'pdh': None, 'hq': None, 'hc': None, 'fail': 0, 'disabled_until': 0.0,
+       'lock': threading.Lock(), 'val': None, 't': 0.0}
+_tz_ready = False
+
+
+def _tz_open():
+    """打开 PDH 查询并绑定热区计数器。失败返回 False(之后一直走 EC 裸读)。"""
+    global _tz_ready
+    if _tz_ready:
+        return _tz['hq'] is not None
+    _tz_ready = True
+    try:
+        pdh = ctypes.WinDLL('pdh.dll')
+        pdh.PdhOpenQueryW.argtypes = [w.LPCWSTR, ctypes.c_size_t,
+                                      ctypes.POINTER(ctypes.c_void_p)]
+        pdh.PdhOpenQueryW.restype = ctypes.c_ulong
+        pdh.PdhAddCounterW.argtypes = [ctypes.c_void_p, w.LPCWSTR, ctypes.c_size_t,
+                                       ctypes.POINTER(ctypes.c_void_p)]
+        pdh.PdhAddCounterW.restype = ctypes.c_ulong
+        pdh.PdhCollectQueryData.argtypes = [ctypes.c_void_p]
+        pdh.PdhCollectQueryData.restype = ctypes.c_ulong
+        pdh.PdhGetFormattedCounterValue.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(_PDH_FMT_COUNTERVALUE)]
+        pdh.PdhGetFormattedCounterValue.restype = ctypes.c_ulong
+        hq, hc = ctypes.c_void_p(), ctypes.c_void_p()
+        if pdh.PdhOpenQueryW(None, 0, ctypes.byref(hq)) != 0:
+            return False
+        if pdh.PdhAddCounterW(hq, TZ_COUNTER_PATH, 0, ctypes.byref(hc)) != 0:
+            return False
+        pdh.PdhCollectQueryData(hq)          # 第一次只是建基准, 值要下一次才有效
+        _tz['pdh'], _tz['hq'], _tz['hc'] = pdh, hq, hc
+        return True
+    except Exception:
+        return False
+
+
+def tz_temp():
+    """ACPI 热区温度(°C, 整数)。失败返回 None —— 调用方应退回 ec_read_ok(EC_TEMP)。"""
+    now = time.time()
+    if now < _tz['disabled_until']:
+        return None
+    with _tz['lock']:
+        if not _tz_open():
+            _tz['disabled_until'] = now + TZ_RETRY_AFTER_S
+            return None
+        try:
+            pdh = _tz['pdh']
+            if pdh.PdhCollectQueryData(_tz['hq']) != 0:
+                raise OSError('collect')
+            cv = _PDH_FMT_COUNTERVALUE()
+            typ = ctypes.c_ulong()
+            if pdh.PdhGetFormattedCounterValue(_tz['hc'], PDH_FMT_DOUBLE,
+                                               ctypes.byref(typ),
+                                               ctypes.byref(cv)) != 0:
+                raise OSError('get')
+            k = float(cv.doubleValue)        # 0.1K
+        except Exception:
+            k = 0.0
+        # 合理范围 20.0°C ~ 126.85°C。出界说明这条通道这次没拿到有效值(计数器刚重置等)
+        if not (2000.0 <= k <= 4000.0):
+            _tz['fail'] += 1
+            if _tz['fail'] >= TZ_MAX_FAIL:
+                _tz['disabled_until'] = now + TZ_RETRY_AFTER_S
+            return None
+        _tz['fail'] = 0
+        c = int(round(k / 10.0 - 273.15))
+        if not (TZ_TEMP_LO <= c <= TZ_TEMP_HI):
+            return None
+        _tz['val'], _tz['t'] = c, now
+        return c
+
+
 def ec_temp():
-    """EC 温度寄存器(°C)。有效范围 0~127（0x80 是固件的"无效"哨兵值, AML 会把它当成 48°C）。
-    本机实测: 空闲 49~57, 40W 满载+满速风峰值 ~92。出界当读失败。"""
+    """CPU 温度(°C)。
+
+    ★2026-10-23: 优先走 ACPI 热区(见上面 tz_temp 的注释), 拿不到才退回裸读 EC 0x78。
+      正常情况下每轮省下 2 笔 EC 事务, 更重要的是**不再和 _TMP 抢同一个寄存器** ——
+      那条路径的失败终点是"固件报 _HOT -> 强制休眠", 现在从根上不存在了。
+    0x80 是固件的"无效"哨兵值(AML 会把它当成 48°C), 只在退回裸读时才可能遇到。
+    """
     global _EC_TEMP_SENTINEL_SEEN
     _EC_TEMP_SENTINEL_SEEN = False
+    t = tz_temp()
+    if t is not None:
+        return t
     v = ec_read_ok(EC_TEMP)
     if v == EC_TEMP_SENTINEL:
         _EC_TEMP_SENTINEL_SEEN = True
@@ -1949,6 +2313,15 @@ def tick(cfg=None, ec=True, read_flags=True):
     except Exception:
         dts = None
     flags = _G.get('last_flags') or {}
+    # ★2026-10-23: 开机静默窗口 —— 见 EC_BOOT_QUIET_S 的注释。
+    #   只挡"固件标志读"(这是 tick 里唯一还会真碰 EC 的路径, 每次 9 笔事务);
+    #   ec_temp 已走 ACPI 热区, 不占 EC。
+    if read_flags and EC_BOOT_QUIET_S > 0:
+        _up = unbiased_uptime()
+        if _up is None:
+            _up = uptime()
+        if 0 <= _up < EC_BOOT_QUIET_S:
+            read_flags = False
     fresh = bool(ec and read_flags)
     if fresh:
         try:
