@@ -1,0 +1,397 @@
+# -*- coding: utf-8 -*-
+"""CpuPLFix 配置工具 —— 只改 config.json, 不碰硬件。**只管 CPU 功耗墙/过热保护, 不管风扇。**
+
+    CpuPLFixCfg.py             看当前配置
+    CpuPLFixCfg.py ac=40,55    改插电 PL1/PL2
+    CpuPLFixCfg.py hold=60 改固件标志锁存判定秒数（0=关掉这条出口）
+    CpuPLFixCfg.py tpower=on/off 温度→功耗调节器（日常功耗跟着温度走；默认 off）
+    CpuPLFixCfg.py flag_pl=20,28 标志置位但温度正常时的 PL1,PL2（默认 20/28W，比预警档更紧）
+    CpuPLFixCfg.py gmin=30 保护最短驻留秒数 / rel=10 解除驻留秒数
+    CpuPLFixCfg.py flag_slow=120 凉机时固件标志读的间隔（秒）
+    CpuPLFixCfg.py flag_rel=97,60 标志挂着但温度连续 ≤97°C 满 60 秒就自动放开
+    CpuPLFixCfg.py warn_pl2=35 预警档收 PL2 到 35W（PL1 由 warn_pl1 单独设，默认保持 28W 不动）
+    CpuPLFixCfg.py crit_hold=10 严重档驻留 10 秒（压不下来才算数）
+    CpuPLFixCfg.py step_dwell=15 每级压 15 秒没效果就再深一级
+    CpuPLFixCfg.py ramp=30 解除后每级回升 30 秒
+    CpuPLFixCfg.py crit2=20,25 第二级功耗墙（PL1,PL2）
+    CpuPLFixCfg.py crit3=12,14 地板级功耗墙（PL1,PL2）
+    CpuPLFixCfg.py undo        撤销上一次保存
+    CpuPLFixCfg.py raw         打印完整 JSON
+
+风扇不在这里改 —— 用 T14scontrol\\fan 里的 FanControl。
+保存后由看守服务在 60 秒内自动重读, 不用重启、不用管理员。
+"""
+import io
+import json
+import os
+import shutil
+import sys
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+CFG = os.path.join(BASE, 'config.json')
+BAK = CFG + '.bak'
+
+# ---------------------------------------------------------------- 读写
+def load(path=CFG):
+    with io.open(path, encoding='utf-8') as f:
+        return json.load(f)
+
+
+def atomic_write(path, text):
+    tmp = path + '.tmp'
+    with io.open(tmp, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def dump(cfg):
+    return json.dumps(cfg, indent=2, ensure_ascii=False) + '\n'
+
+
+def save(cfg):
+    old = None
+    try:
+        with io.open(CFG, encoding='utf-8') as f:
+            old = f.read()
+    except OSError:
+        pass
+    text = dump(cfg)
+    if old and old.strip() and old != text:
+        atomic_write(BAK, old)      # 只留一版, 用于 undo
+    atomic_write(CFG, text)
+
+
+# ---------------------------------------------------------------- 显示
+def show(cfg):
+    g = cfg['guard']
+    onoff = lambda b: '开' if b else '关'
+    print()
+    print('CpuPLFix 配置  %s' % CFG)
+    print('服务每 60 秒自动重读；改完即生效（切 mmio_mode 要重启）')
+    print()
+    print('【功耗墙】插电 %g/%g W   电池 %s'
+          % (cfg['pl1_w'], cfg['pl2_w'],
+             '跟随插电' if not cfg['pl1_w_batt'] else '%g/%g W' % (cfg['pl1_w_batt'], cfg['pl2_w_batt'])))
+    print('  ac=%g,%g         插电 PL1,PL2（0 = 自动）' % (cfg['pl1_w'], cfg['pl2_w']))
+    print('  batt=%g,%g       电池 PL1,PL2（0,0 = 跟随插电）' % (cfg['pl1_w_batt'], cfg['pl2_w_batt']))
+    print('  time=%d,%d         PL1,PL2 时间窗（秒）' % (cfg['pl1_time'], cfg['pl2_time']))
+    print('  min_pl1=%g        自动模式兜底下限（W）' % cfg['min_pl1_w'])
+    print('  mmio=%s        disable=清零锁死固件侧(推荐) / value=写值再锁'
+          % cfg['mmio_mode'])
+    print('  lock=%s          锁定 MMIO' % ('on' if cfg['lock_mmio'] else 'off'))
+    print('  poll=%g,%g,%g      主循环/EC/固件标志（秒）'
+          % (cfg['poll_s'], cfg['ec_poll_s'], cfg['flag_poll_s']))
+    print('  flag_slow=%g       凉机(EC < flag_hot)时标志读的间隔（秒，少打扰 EC）'
+          % cfg.get('flag_poll_slow_s', 120.0))
+    print()
+    print('【风扇】不归本工具管 —— 用 T14scontrol\\fan 的 FanControl（本工具不读不写 0x2F）')
+    print()
+    print('【过热保护】%s' % onoff(g['enabled']))
+    print('  guard=%g,%g,%g,%g          预警/严重/逃生/解除（C）'
+          % (g['warn_c'], g['crit_c'], g['escape_c'], g['recover_c']))
+    print('  pl_guard=%g,%g,%g,%g        预警 PL1,PL2 / 严重 PL1,PL2（W）'
+          % (g['warn_pl1_w'], g['warn_pl2_w'], g['crit_pl1_w'], g['crit_pl2_w']))
+    print('  dts=%g             DTS 危险线：连续两拍 ≥ 它就至少进第二级（20/25W，C）'
+          % g['dts_crit_c'])
+    print('  dts_now=%g        DTS 单拍 ≥ 它（TjMax）就立即进第二级'
+          % g.get('dts_hot_now_c', 100.0))
+    print('  dts_warn=%g         DTS 快通道：EC 还没到预警线就先收 PL2（C，0=关）'
+          % (g.get('dts_warn_c') or 0.0))
+    print('  flag_hot=%g        固件标志加密温度（C）' % g['flag_hot_c'])
+    print('  guard_on=%s  trip=%s  hibernate=%s'
+          % (onoff(g['enabled']), onoff(g['trip_flags']), onoff(g['escape_hibernate'])))
+    print('  hold=%g            固件标志锁存判定秒数（0=关掉这条出口）'
+          ' ★=同时写 flag_rel 的秒数，两者等价'
+          % g.get('trip_hold_s', 45.0))
+    print('  tpower=%s          温度→功耗调节器（风扇优先：日常功耗跟着温度走；关=用固定 pl1_w）'
+          % onoff(g.get('temp_power', False)))
+    print('  flag_pl=%g,%g       标志置位但温度正常时的 PL1,PL2（不砍到地板档）'
+          % (g.get('flag_pl1_w', 20.0), g.get('flag_pl2_w', 28.0)))
+    print('  gmin=%g  rel=%g     保护最短驻留 / 解除驻留（秒，防保护档来回切）'
+          % (g.get('min_hold_s', 30.0), g.get('release_dwell_s', 10.0)))
+    print('  cool_tail 已移除（风扇分离后由 fan 工具管）')
+    print('  严重档三级          %.0f/%.0fW -> %.0f/%.0fW -> %.0f/%.0fW（PBP -> Minimum '
+          'Assured Power -> 地板）'
+          % (g.get('crit_pl1_w', 28.0), g.get('crit_pl2_w', 35.0),
+             g.get('crit2_pl1_w', 20.0), g.get('crit2_pl2_w', 25.0),
+             g.get('crit3_pl1_w', 12.0), g.get('crit3_pl2_w', 14.0)))
+    print('  crit_hold=%g       驻留：持续这么久 ≥严重线才进严重档（0=碰线就动作）'
+          % g.get('crit_hold_s', 10.0))
+    print('  crit_now=%g / floor=%g  单次 EC 到它就跳第二级 / 到它就下地板（C）'
+          % (g.get('crit_now_c', 99.0), g.get('crit_floor_c', 100.0)))
+    print('  step_dwell=%g      每级停留这么久还压不下来就再深一级（秒）'
+          % g.get('step_dwell_s', 15.0))
+    print('  ramp=%g            解除后每级回升秒数（0=直接回原档）'
+          % g.get('ramp_step_s', 30.0))
+    print('  flag_rel=%g,%g    标志挂着但温度连续 ≤该线 达该秒数 -> 判固件锁存、自动放开'
+          '（0 秒=不自动解除；该线默认 92，比 crit_c 98 低 6°C，留出安全余量）'
+          % (g.get('flag_release_c', 92.0), g.get('flag_release_s', 60.0)))
+    print('  warn_pl2=%g        预警档 PL2 收到这里（PL1 由 warn_pl1 单独设，默认 28W 不动）'
+          % g.get('warn_pl2_w', 40.0))
+    print()
+    print('改值：3-config.bat ac=40,55   |   撤销：3-config.bat undo   |   全部用法：3-config.bat help')
+    print()
+
+
+# ---------------------------------------------------------------- 解析
+class Fail(Exception):
+    pass
+
+
+def _pair(val, what):
+    """解析 "28,35" 这种 PL1,PL2 对。"""
+    parts = str(val).replace('/', ',').split(',')
+    if len(parts) != 2:
+        raise SystemExit('%s 要写成 PL1,PL2（例如 20,25），收到的是 %r' % (what, val))
+    return (_num(parts[0], 3, 200, what + ' 的 PL1'), _num(parts[1], 3, 200, what + ' 的 PL2'))
+
+
+def _num(v, lo, hi, name, integer=False, allow_zero=False):
+    try:
+        x = float(v)
+    except ValueError:
+        raise Fail('%s 必须是数字：%s' % (name, v))
+    if allow_zero and x == 0:
+        return 0 if integer else 0.0
+    if x < lo or x > hi:
+        raise Fail('%s 超出范围 %g~%g：%g' % (name, lo, hi, x))
+    if integer:
+        if abs(x - round(x)) > 1e-9:
+            raise Fail('%s 必须是整数：%s' % (name, v))
+        return int(round(x))
+    return x
+
+
+def _nums(v, n, name):
+    xs = [s.strip() for s in str(v).split(',')]
+    if len(xs) != n:
+        raise Fail('%s 需要 %d 个数（用逗号分隔）：%s' % (name, n, v))
+    return xs
+
+
+def _bool(v, name):
+    s = str(v).strip().lower()
+    if s in ('on', '1', 'true', 'yes', 'y', '开'):
+        return True
+    if s in ('off', '0', 'false', 'no', 'n', '关'):
+        return False
+    raise Fail('%s 只能是 on/off：%s' % (name, v))
+
+
+def apply_kv(cfg, key, val):
+    k = key.strip().lower()
+    g = cfg['guard']
+
+    if k == 'ac':
+        a, b = _nums(val, 2, 'ac')
+        cfg['pl1_w'] = _num(a, 5, 150, 'ac 的 PL1', allow_zero=True)
+        cfg['pl2_w'] = _num(b, 5, 150, 'ac 的 PL2', allow_zero=True)
+    elif k == 'batt':
+        a, b = _nums(val, 2, 'batt')
+        cfg['pl1_w_batt'] = _num(a, 5, 150, 'batt 的 PL1', allow_zero=True)
+        cfg['pl2_w_batt'] = _num(b, 5, 150, 'batt 的 PL2', allow_zero=True)
+    elif k == 'time':
+        a, b = _nums(val, 2, 'time')
+        cfg['pl1_time'] = _num(a, 1, 255, 'PL1 时间窗', integer=True)
+        cfg['pl2_time'] = _num(b, 1, 255, 'PL2 时间窗', integer=True)
+    elif k == 'min_pl1':
+        cfg['min_pl1_w'] = _num(val, 5, 150, 'min_pl1')
+    elif k == 'mmio':
+        s = str(val).strip().lower()
+        if s not in ('disable', 'value'):
+            raise Fail('mmio 只能是 disable 或 value')
+        cfg['mmio_mode'] = s
+    elif k == 'lock':
+        cfg['lock_mmio'] = _bool(val, 'lock')
+    elif k == 'poll':
+        a, b, c = _nums(val, 3, 'poll')
+        cfg['poll_s'] = _num(a, 1, 600, '主循环间隔')
+        cfg['ec_poll_s'] = _num(b, 2, 600, 'EC 读间隔')
+        cfg['flag_poll_s'] = _num(c, 2, 600, '固件标志间隔')
+    elif k == 'guard':
+        xs = _nums(val, 4, 'guard')
+        g['warn_c'] = _num(xs[0], 30, 120, '预警温度')
+        g['crit_c'] = _num(xs[1], 30, 125, '严重温度')
+        g['escape_c'] = _num(xs[2], 30, 130, '逃生温度')
+        g['recover_c'] = _num(xs[3], 20, 115, '解除温度')
+    elif k == 'pl_guard':
+        xs = _nums(val, 4, 'pl_guard')
+        g['warn_pl1_w'] = _num(xs[0], 4, 150, '预警 PL1')
+        g['warn_pl2_w'] = _num(xs[1], 4, 150, '预警 PL2')
+        g['crit_pl1_w'] = _num(xs[2], 4, 150, '严重 PL1')
+        g['crit_pl2_w'] = _num(xs[3], 4, 150, '严重 PL2')
+    elif k == 'dts':
+        g['dts_crit_c'] = _num(val, 40, 125, 'dts')
+    elif k == 'dts_warn':
+        g['dts_warn_c'] = _num(val, 0, 125, 'dts_warn', allow_zero=True)
+    elif k == 'flag_hot':
+        g['flag_hot_c'] = _num(val, 30, 115, 'flag_hot')
+    elif k == 'guard_on':
+        g['enabled'] = _bool(val, 'guard_on')
+    elif k == 'trip':
+        g['trip_flags'] = _bool(val, 'trip')
+    elif k == 'hold':
+        # ★2026-10-20 修: 新代码的锁存判定读的是 flag_release_s（默认 60），
+        #   只写 trip_hold_s 的话 `hold=` 改了不生效（用户可感知的"改了没反应"）。
+        #   这里两个键一起写 —— trip_hold_s 留给旧版代码/旧配置读，flag_release_s 给现版读。
+        _hv = _num(val, 0, 3600, '锁存判定秒数（0=关）', allow_zero=True)
+        g['trip_hold_s'] = _hv
+        g['flag_release_s'] = _hv
+    elif k == 'tpower':
+        # ★2026-10-20: 温度→功耗调节器("风扇优先"模型), 默认关。
+        # on = 日常功耗跟着温度走(顶档受 ac= 配的 pl1_w 约束), 保护阶梯只在 ≥98°C 接手。
+        g['temp_power'] = _bool(val, 'tpower')
+    elif k == 'flag_pl':
+        a, b = _nums(val, 2, 'flag_pl')
+        g['flag_pl1_w'] = _num(a, 5, 150, '标志档 PL1', allow_zero=True)
+        g['flag_pl2_w'] = _num(b, 5, 150, '标志档 PL2', allow_zero=True)
+    elif k == 'gmin':
+        g['min_hold_s'] = _num(val, 0, 600, '保护最短驻留秒数（0=关）', allow_zero=True)
+    elif k == 'rel':
+        g['release_dwell_s'] = _num(val, 0, 600, '解除驻留秒数（0=关）', allow_zero=True)
+    elif k == 'flag_slow':
+        cfg['flag_poll_slow_s'] = _num(val, 2, 3600, '凉机标志读间隔秒数', allow_zero=True)
+    elif k == 'flag_rel':
+        p = _pair(val, '标志档自动解除')
+        g['flag_release_c'] = _num(p[0], 40, 105, '标志档解除温度线')
+        g['flag_release_s'] = _num(p[1], 0, 3600, '标志档解除秒数（0=不自动解除）',
+                                   allow_zero=True)
+    elif k == 'warn_pl2':
+        g['warn_pl2_w'] = _num(val, 15, 200, '预警档只收 PL2 到多少瓦')
+    elif k == 'crit_hold':
+        g['crit_hold_s'] = _num(val, 0, 600, '严重档驻留秒数（0=碰线就动作）', allow_zero=True)
+    elif k == 'step_dwell':
+        g['step_dwell_s'] = _num(val, 3, 600, '每级停留秒数（压不下来就再深一级）')
+    elif k == 'ramp':
+        g['ramp_step_s'] = _num(val, 0, 600, '解除后每级回升秒数（0=直接回原档）', allow_zero=True)
+    elif k == 'crit2':
+        p = _pair(val, '第二级')
+        g['crit2_pl1_w'], g['crit2_pl2_w'] = p
+    elif k == 'crit3':
+        p = _pair(val, '地板级')
+        g['crit3_pl1_w'], g['crit3_pl2_w'] = p
+    elif k == 'hibernate':
+        g['escape_hibernate'] = _bool(val, 'hibernate')
+    # ---- 单项简写
+    elif k in ('pl1', 'pl2', 'pl1_batt', 'pl2_batt'):
+        path = {'pl1': 'pl1_w', 'pl2': 'pl2_w',
+                'pl1_batt': 'pl1_w_batt', 'pl2_batt': 'pl2_w_batt'}[k]
+        cfg[path] = _num(val, 5, 150, k, allow_zero=True)
+    elif k in ('warn', 'crit', 'escape', 'recover'):
+        path = {'warn': 'warn_c', 'crit': 'crit_c',
+                'escape': 'escape_c', 'recover': 'recover_c'}[k]
+        g[path] = _num(val, 20, 130, k)
+    elif k in ('warn_pl1', 'warn_pl2', 'crit_pl1', 'crit_pl2'):
+        g[k + '_w'] = _num(val, 4, 150, k)
+    elif k in ('poll_s', 'ec_poll', 'flag_poll'):
+        path = {'poll_s': 'poll_s', 'ec_poll': 'ec_poll_s', 'flag_poll': 'flag_poll_s'}[k]
+        cfg[path] = _num(val, 1, 600, k)
+    else:
+        raise Fail('不认识的项：%s（运行 3-config.bat help 看用法）' % key)
+
+
+def check(cfg):
+    """整体一致性检查。返回 warning 列表；不合法直接抛 Fail。"""
+    g = cfg['guard']
+    warns = []
+    if not (g['recover_c'] < g['warn_c'] < g['crit_c'] <= g['escape_c']):
+        raise Fail('温度阈值必须满足 解除 < 预警 < 严重 <= 逃生')
+    if g['crit_pl1_w'] > g['warn_pl1_w']:
+        warns.append('严重档 PL1 比预警档还高，保护力度是反的')
+    if g['crit_pl2_w'] > g['warn_pl2_w']:
+        warns.append('严重档 PL2 比预警档还高，保护力度是反的')
+    if 0 < cfg['pl1_w'] and 0 < cfg['pl2_w'] and cfg['pl2_w'] < cfg['pl1_w']:
+        warns.append('PL2 低于 PL1，工具会自动抬平（等于没有爆发）')
+    if 0 < cfg['pl1_w_batt'] and 0 < cfg['pl2_w_batt'] and cfg['pl2_w_batt'] < cfg['pl1_w_batt']:
+        warns.append('电池档 PL2 低于 PL1，工具会自动抬平')
+    if cfg['flag_poll_s'] < cfg['ec_poll_s']:
+        warns.append('固件标志读得比 EC 温度还勤，建议 flag_poll 不小于 ec_poll')
+    if cfg['mmio_mode'] == 'value':
+        warns.append('mmio=value 是锁死 MMIO 的老方案，改功耗墙要重启')
+    if not cfg['lock_mmio']:
+        warns.append('lock=off 时固件可能把功耗墙改回去')
+    if not g['enabled']:
+        warns.append('过热保护已关闭')
+    if g['escape_hibernate']:
+        warns.append('hibernate=on：到逃生温度会主动休眠，未保存的工作可能丢')
+    return warns
+
+
+# ---------------------------------------------------------------- 主流程
+def main(argv):
+    if os.path.exists(CFG):
+        try:
+            cfg = load()
+        except Exception as e:
+            print('[X] config.json 不是合法 JSON：%s' % e)
+            print('    先运行 3-config.bat undo 恢复上一版')
+            return 1
+    else:
+        print('[X] 找不到 %s' % CFG)
+        return 1
+
+    args = [a for a in argv if a.strip()]
+    if not args:
+        show(cfg)
+        return 0
+    if args[0].lower() in ('help', '-h', '--help', '?'):
+        print(__doc__.strip())
+        show(cfg)
+        return 0
+    if args[0].lower() == 'raw':
+        print(dump(cfg), end='')
+        return 0
+    if args[0].lower() == 'undo':
+        if not os.path.exists(BAK):
+            print('[X] 没有可撤销的备份（%s 不存在）' % BAK)
+            return 1
+        try:
+            old = load(BAK)
+        except Exception as e:
+            print('[X] 备份文件也坏了：%s' % e)
+            return 1
+        atomic_write(CFG, dump(old))
+        print('已恢复到上一次保存前的内容。')
+        show(load())
+        return 0
+
+    before = dump(cfg)
+    changed = []
+    for a in args:
+        if '=' not in a:
+            print('[X] 格式不对：%s（应该是 键=值，例如 ac=40,55）' % a)
+            show(cfg)
+            return 2
+        k, v = a.split('=', 1)
+        try:
+            apply_kv(cfg, k, v)
+            changed.append(k.strip())
+        except Fail as e:
+            print('[X] %s' % e)
+            return 2
+
+    try:
+        warns = check(cfg)
+    except Fail as e:
+        print('[X] %s' % e)
+        return 2
+
+    if dump(cfg) == before:
+        print('数值没有变化，没有写盘。')
+        return 0
+
+    save(cfg)
+    print('已保存（上一版存为 config.json.bak），服务会在 60 秒内自动应用。')
+    for w in warns:
+        print('  [!] %s' % w)
+    show(load())
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(1)
