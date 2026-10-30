@@ -592,9 +592,12 @@ class Hud(object):
         rc, tb_h = self.taskbar()
         s = float(self.cfg.get('scale') or 1.0)
         fh = max(9, int(round(tb_h * 0.27 * s)))          # 与任务栏时钟字高相当
-        hei = min(tb_h - 4, max(fh + 8, int(round(tb_h * 0.62 * s))))
-        pad = max(6, int(round(fh * 0.95)))
-        gap = max(7, int(round(fh * 0.80)))
+        # ★2026-10-30: 整体放松一点。原来 hei=0.62/pad=0.95/gap=0.80,
+        #   6 个字段 + 5 个分隔点全挤在 198px 里, 字离胶囊边只有 10px。
+        #   胶囊高一点、左右内边距和段间距各加一档, 视觉上才不贴边。
+        hei = min(tb_h - 4, max(fh + 10, int(round(tb_h * 0.66 * s))))
+        pad = max(7, int(round(fh * 1.10)))
+        gap = max(8, int(round(fh * 0.95)))
         radius = max(3, hei // 2)          # 胶囊：半径取高度一半，最贴 Win11
         return rc, tb_h, fh, hei, pad, gap, radius
 
@@ -610,16 +613,22 @@ class Hud(object):
         return sz.cx
 
     def spacing(self, i, gap):
-        """第 i 段前的间距：分隔点、标签后收紧，其余用标准间距。"""
+        """第 i 段前的间距。
+
+        ★2026-10-30 修"太挤": 原来第一句是 `cur=='unit' or prev=='unit'` 一律返回 0,
+          于是 `15%` 后面紧跟分隔点时 `%·` 粘在一起(实测截图里 `15%·`、`66°·`、`24W·`
+          几乎连成一串)。单位只该紧贴**它前面的数值**, 不该把它后面的东西也吸过来。
+          改成只看 `cur == 'unit'`, 分隔点两侧统一给 0.75*gap。
+        """
         if i <= 0:
             return 0
         cur, prev = self.segs[i][1], self.segs[i - 1][1]
-        if cur == 'unit' or prev == 'unit':
-            return 0                      # 单位紧贴数值
+        if cur == 'unit':
+            return 0                      # 单位紧贴它前面的数值
         if cur == 'sep' or prev == 'sep':
-            return max(3, int(round(gap * 0.45)))
+            return max(4, int(round(gap * 0.75)))    # 分隔点两侧留白(原 0.45, 偏紧)
         if prev == 'label':
-            return max(2, int(round(gap * 0.32)))
+            return max(2, int(round(gap * 0.35)))
         return gap
 
     def screen_rect(self):
