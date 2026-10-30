@@ -110,6 +110,16 @@ FIELDS = [
 
 SCALES = [('小', 0.80), ('标准', 1.0), ('大', 1.18), ('特大', 1.38)]
 
+# 语义分组（★2026-10-30）：同组内紧凑排布，只有跨组才放分隔点。
+# 原来每个字段之间都插一个 `·`，6 个字段就是 5 个圆点 —— 在 10px 字号下全是噪点。
+# 按语义收成 3~4 组后，圆点降到 2~3 个，视觉上有节奏而不是一串等距的点。
+FIELD_GROUP = {
+    'freq': 0, 'cpu': 0, 'temp': 0, 'dts': 0, 'mem': 0, 'batt': 0, 'guard': 0,
+    'fan': 1, 'gear': 1,
+    'pkg': 2, 'pl': 2,
+    'time': 3,
+}
+
 # 分级阈值：(注意, 警告)。常态一律中性白，越过才上暖黄/红 —— 参考 iStat Menus 的做法
 LEVELS = {
     'temp': (80, 90),      # EC 温度
@@ -149,14 +159,14 @@ DEFAULT_CFG = {
 PALETTE = {
     'dark': {
         'pill': (32, 32, 35, 214), 'line': (255, 255, 255, 14),
-        'fg': (240, 240, 242), 'dim': (158, 158, 165), 'sep': (94, 94, 100),
-        'label': (140, 140, 147), 'unit': (132, 132, 140),
+        'fg': (240, 240, 242), 'dim': (158, 158, 165), 'sep': (88, 88, 94),
+        'label': (124, 124, 131), 'unit': (116, 116, 124),
         'hot': [(80, (224, 178, 96)), (90, (240, 110, 106)), (999, (240, 110, 106))],
     },
     'light': {
         'pill': (250, 250, 252, 232), 'line': (20, 20, 24, 14),
-        'fg': (26, 26, 28), 'dim': (92, 92, 99), 'sep': (150, 150, 156),
-        'label': (118, 118, 125), 'unit': (128, 128, 135),
+        'fg': (26, 26, 28), 'dim': (92, 92, 99), 'sep': (156, 156, 162),
+        'label': (134, 134, 141), 'unit': (144, 144, 151),
         'hot': [(80, (196, 136, 36)), (90, (200, 68, 64)), (999, (200, 68, 64))],
     },
 }
@@ -453,10 +463,14 @@ def collect(cfg):
     fan = fan if _fresh(fan) else {}
     segs = []
     mode = cfg.get('labels') or 'short'
+    _cur = {'g': 0}        # 当前字段属于哪一组
+    _last = {'g': None}    # 上一个已输出段属于哪一组
 
     def add(label, text, role='fg', unit=None):
-        if segs:
-            segs.append(('\u00b7', 'sep'))
+        g = _cur['g']
+        if segs and g != _last['g']:
+            segs.append(('\u00b7', 'sep'))     # 只在跨组时放分隔点
+        _last['g'] = g
         if label:
             segs.append((label, 'label'))
         segs.append((text, role))
@@ -464,6 +478,7 @@ def collect(cfg):
             segs.append((unit, 'unit'))      # 单位一档更暗，数值才是重点
 
     for f in cfg['fields']:
+        _cur['g'] = FIELD_GROUP.get(f, 0)
         if f == 'freq':
             v = cpu.get('freq_mhz')
             if v:
@@ -554,6 +569,7 @@ class Hud(object):
         self.cfg = cfg
         self.hwnd = None
         self.font = None
+        self.font_unit = None
         self.font_px = 0
         self.segs = []
         self.widths = []
@@ -592,12 +608,11 @@ class Hud(object):
         rc, tb_h = self.taskbar()
         s = float(self.cfg.get('scale') or 1.0)
         fh = max(9, int(round(tb_h * 0.27 * s)))          # 与任务栏时钟字高相当
-        # ★2026-10-30: 整体放松一点。原来 hei=0.62/pad=0.95/gap=0.80,
-        #   6 个字段 + 5 个分隔点全挤在 198px 里, 字离胶囊边只有 10px。
-        #   胶囊高一点、左右内边距和段间距各加一档, 视觉上才不贴边。
-        hei = min(tb_h - 4, max(fh + 10, int(round(tb_h * 0.66 * s))))
-        pad = max(7, int(round(fh * 1.10)))
-        gap = max(8, int(round(fh * 0.95)))
+        # ★2026-10-30: 上一版把 pad/gap 放大到 1.10/0.95 太松(250px)，收回来。
+        #   现在靠"组内紧、组间松"做层次，而不是整体拉大间距。
+        hei = min(tb_h - 4, max(fh + 8, int(round(tb_h * 0.64 * s))))
+        pad = max(6, int(round(fh * 0.90)))
+        gap = max(7, int(round(fh * 0.85)))
         radius = max(3, hei // 2)          # 胶囊：半径取高度一半，最贴 Win11
         return rc, tb_h, fh, hei, pad, gap, radius
 
@@ -607,29 +622,42 @@ class Hud(object):
             theme = 'light' if system_is_light() else 'dark'
         return PALETTE.get(theme, PALETTE['dark'])
 
-    def measure(self, hdc, text):
+    def measure(self, hdc, text, small=False):
+        if small and self.font_unit:
+            gdi32.SelectObject(hdc, self.font_unit)
         sz = w.SIZE()
         gdi32.GetTextExtentPoint32W(hdc, text, len(text), ctypes.byref(sz))
+        if small and self.font_unit:
+            gdi32.SelectObject(hdc, self.font)
         return sz.cx
 
     def spacing(self, i, gap):
         """第 i 段前的间距。
 
-        ★2026-10-30 修"太挤": 原来第一句是 `cur=='unit' or prev=='unit'` 一律返回 0,
-          于是 `15%` 后面紧跟分隔点时 `%·` 粘在一起(实测截图里 `15%·`、`66°·`、`24W·`
-          几乎连成一串)。单位只该紧贴**它前面的数值**, 不该把它后面的东西也吸过来。
-          改成只看 `cur == 'unit'`, 分隔点两侧统一给 0.75*gap。
+        ★2026-10-30 重做（修"百分比压数字" + "太松散"）：
+
+        1) `13` + `%` 重叠的根因在**度量**，不在间距：
+           实测 Segoe UI Variable @10px，'13' 的 extent=9 且墨迹正好铺满 [0..8]，
+           '%' 的墨迹也从 0 开始（没有左 bearing）。两段相接时中间只剩 **1px**，
+           `%` 左下那个圈又比字形框更靠左，视觉上就是压上去了。
+           解法不是加大间距（加到 3px 就变成 `33 %` 像两个词），而是**把单位缩小一号**
+           （见 make_font），再留 1px —— 既紧凑又一眼看出是单位。
+
+        2) 同组内（如 `CPU 13% 84°`）用 0.45 字高，跨组（如 `84° · 4636`）用 0.85 gap。
+           组内紧、组间松，才有分组感；全用同一个间距就成了一串等距的点。
         """
         if i <= 0:
             return 0
         cur, prev = self.segs[i][1], self.segs[i - 1][1]
+        fh = max(9, self.font_px or 10)
         if cur == 'unit':
-            return 0                      # 单位紧贴它前面的数值
+            # 单位已小一号(-2px)，贴到 1px 也不会糊；0 会让 `%` 左下角的圈压到数字
+            return max(1, int(round(fh * 0.08)))
         if cur == 'sep' or prev == 'sep':
-            return max(4, int(round(gap * 0.75)))    # 分隔点两侧留白(原 0.45, 偏紧)
+            return max(4, int(round(gap * 0.85)))    # 组间
         if prev == 'label':
-            return max(2, int(round(gap * 0.35)))
-        return gap
+            return max(2, int(round(fh * 0.30)))
+        return max(3, int(round(fh * 0.45)))         # 组内
 
     def screen_rect(self):
         left = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
@@ -643,9 +671,17 @@ class Hud(object):
             return
         if self.font:
             gdi32.DeleteObject(self.font)
+        if self.font_unit:
+            gdi32.DeleteObject(self.font_unit)
         self.font_px = fh
         self.font = gdi32.CreateFontW(-fh, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 4, 0,
                                       'Segoe UI Variable Text')
+        # ★2026-10-30: 单位单独用小一号字体（-2px）。
+        #   同字号下 `%`/`°`/`W` 和数字一样大，要么贴死(0px)要么推开(3px)像两个词；
+        #   小一号后可以贴到 1px，既紧凑又一眼能看出是单位 —— 这也是 iStat Menus
+        #   和任务栏时钟的通行做法（主信息大、附属信息小）。
+        self.font_unit = gdi32.CreateFontW(-max(8, fh - 2), 0, 0, 0, 400, 0, 0, 0,
+                                           0, 0, 0, 4, 0, 'Segoe UI Variable Text')
 
     # ---- 双缓冲 DIB
     def ensure_buffers(self, wid, hei):
@@ -733,11 +769,26 @@ class Hud(object):
         try:
             self.make_font(hdc, fh)
             gdi32.SelectObject(hdc, self.font)
-            self.widths = [self.measure(hdc, t) for t, _r in self.segs]
+            self.widths = [self.measure(hdc, t, r == 'unit') for t, r in self.segs]
             gaps = sum(self.spacing(i, gap) for i in range(1, len(self.segs)))
             wid = max(40, sum(self.widths) + gaps + pad * 2)
         finally:
             user32.ReleaseDC(self.hwnd, hdc)
+
+        # 临时诊断：BASE 下放 debug.flag 时把布局明细写出来（排查完就删掉这个分支）
+        if os.path.exists(os.path.join(BASE, 'debug.flag')):
+            try:
+                with open(os.path.join(BASE, 'hud_debug.log'), 'w', encoding='utf-8') as dbg:
+                    dbg.write('tb_h=%d fh=%d hei=%d pad=%d gap=%d radius=%d\n'
+                              % (tb_h, fh, hei, pad, gap, radius))
+                    dbg.write('wid=%d  sum_w=%d  gaps=%d  pad*2=%d\n'
+                              % (wid, sum(self.widths), gaps, pad * 2))
+                    for i, (t, r2) in enumerate(self.segs):
+                        dbg.write('%2d %-8r %-6s w=%2d sp=%2d\n'
+                                  % (i, t, r2, self.widths[i],
+                                     self.spacing(i, gap) if i else 0))
+            except Exception:
+                pass
 
         r = w.RECT()
         user32.GetWindowRect(self.hwnd, ctypes.byref(r))
@@ -777,10 +828,14 @@ class Hud(object):
             if i:
                 x += self.spacing(i, gap)
             bw = self.widths[i] if i < len(self.widths) else 0
+            # 单位用小一号字体（见 make_font 注释）
+            fnt = self.font_unit if (role == 'unit' and self.font_unit) else self.font
+            gdi32.SelectObject(self.tmemdc, fnt)
             box.left, box.right = x, x + bw + 3
             user32.DrawTextW(self.tmemdc, txt, -1, ctypes.byref(box),
                              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
             if not pill:
+                gdi32.SelectObject(self.smemdc, fnt)
                 sbox = w.RECT(x + 1, 1, x + bw + 4, hei + 1)
                 user32.DrawTextW(self.smemdc, txt, -1, ctypes.byref(sbox),
                                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
