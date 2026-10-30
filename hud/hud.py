@@ -55,6 +55,7 @@ SW_HIDE = 0
 SW_SHOWNOACTIVATE = 4
 TRANSPARENT = 1
 DT_LEFT = 0x0000
+DT_RIGHT = 0x0002
 DT_VCENTER = 0x0004
 DT_SINGLELINE = 0x0020
 DT_NOPREFIX = 0x0800
@@ -119,6 +120,22 @@ FIELD_GROUP = {
     'pkg': 2, 'pl': 2,
     'time': 3,
 }
+
+# ★2026-10-30 固定占位：数值用**等宽字体 + 空格补位**（`'%3s' % '9'` -> `'  9'`）。
+#   实测 Segoe UI 用空格补位后宽度极差 4~6px，Consolas 是 0px ——
+#   只有等宽字体才能让 `9%` 和 `100%` 的 `%` 真正落在同一像素上。
+#   宽度数字 = 该字段最多几位（含 `--` 占位）。
+FIELD_W = {
+    'freq': 4, 'cpu': 3, 'temp': 3, 'dts': 3,
+    'fan': 4, 'gear': 4, 'pkg': 2, 'pl': 5,
+    'mem': 3, 'batt': 3,
+}
+
+# Segoe Fluent Icons（Win11 自带）。实测 E950 是芯片、E951 是温度计。
+ICON_CPU = '\uE950'
+ICON_TEMP = '\uE951'
+
+SEP_CHAR = '\u00b7'          # 圆点：比 `│`(9px 宽)轻，13px 下不抢戏
 
 # 分级阈值：(注意, 警告)。常态一律中性白，越过才上暖黄/红 —— 参考 iStat Menus 的做法
 LEVELS = {
@@ -463,22 +480,30 @@ def collect(cfg):
     fan = fan if _fresh(fan) else {}
     segs = []
     mode = cfg.get('labels') or 'short'
-    _cur = {'g': 0}        # 当前字段属于哪一组
-    _last = {'g': None}    # 上一个已输出段属于哪一组
+    _cur = {'g': 0, 'f': None}     # 当前字段属于哪一组、哪个字段
+    _last = {'g': None}            # 上一个已输出段属于哪一组
 
-    def add(label, text, role='fg', unit=None):
+    def add(label, text, role='fg', unit=None, w=0):
         g = _cur['g']
         if segs and g != _last['g']:
-            segs.append(('\u00b7', 'sep'))     # 只在跨组时放分隔点
+            segs.append((SEP_CHAR, 'sep', False))   # 只在跨组时放分隔点
         _last['g'] = g
         if label:
-            segs.append((label, 'label'))
-        segs.append((text, role))
+            # E000 以上是图标字符 -> 用图标字体；普通文字用小一号
+            segs.append((label, 'icon' if ord(label[0]) >= 0xE000 else 'label', False))
+        if not w and role in ('fg', 'dim', 'hot1', 'hot2'):
+            w = FIELD_W.get(_cur['f'], 0)           # 数值段自动补位
+        if w:
+            # 等宽补位：'9' -> '  9'，这样后面的 `%`/`°` 位置恒定
+            segs.append((('%' + str(w) + 's') % text, role, True))
+        else:
+            segs.append((text, role, False))
         if unit:
-            segs.append((unit, 'unit'))      # 单位一档更暗，数值才是重点
+            segs.append((unit, 'unit', False))    # 单位一档更暗、小一号，数值才是重点
 
     for f in cfg['fields']:
         _cur['g'] = FIELD_GROUP.get(f, 0)
+        _cur['f'] = f
         if f == 'freq':
             v = cpu.get('freq_mhz')
             if v:
@@ -487,7 +512,8 @@ def collect(cfg):
                 add(None, '--', 'dim', 'G')
         elif f == 'cpu':
             u = cached_cpu_usage()
-            lb = 'CPU' if mode != 'none' else None
+            # 用芯片图标代替 "CPU" 三个字母：省 13px，且比文字更安静
+            lb = ICON_CPU if mode != 'none' else None
             if u is None:
                 add(lb, '--', 'dim', '%')
             else:
@@ -570,6 +596,8 @@ class Hud(object):
         self.hwnd = None
         self.font = None
         self.font_unit = None
+        self.font_num = None
+        self.font_icon = None
         self.font_px = 0
         self.segs = []
         self.widths = []
@@ -622,12 +650,12 @@ class Hud(object):
             theme = 'light' if system_is_light() else 'dark'
         return PALETTE.get(theme, PALETTE['dark'])
 
-    def measure(self, hdc, text, small=False):
-        if small and self.font_unit:
-            gdi32.SelectObject(hdc, self.font_unit)
+    def measure(self, hdc, text, fnt=None):
+        if fnt is not None:
+            gdi32.SelectObject(hdc, fnt)
         sz = w.SIZE()
         gdi32.GetTextExtentPoint32W(hdc, text, len(text), ctypes.byref(sz))
-        if small and self.font_unit:
+        if fnt is not None:
             gdi32.SelectObject(hdc, self.font)
         return sz.cx
 
@@ -655,6 +683,11 @@ class Hud(object):
             return max(1, int(round(fh * 0.08)))
         if cur == 'sep' or prev == 'sep':
             return max(4, int(round(gap * 0.85)))    # 组间
+        if prev == 'icon':
+            return 0                                 # 数值自带前导空格，不再额外加
+        if prev == 'unit':
+            # 下一段若已用空格补位（如 `' 69'`），再加间距就松了；否则留一点
+            return 0 if self.segs[i][0].startswith(' ') else max(2, int(round(fh * 0.20)))
         if prev == 'label':
             return max(2, int(round(fh * 0.30)))
         return max(3, int(round(fh * 0.45)))         # 组内
@@ -669,19 +702,33 @@ class Hud(object):
     def make_font(self, hdc, fh):
         if self.font and self.font_px == fh:
             return
-        if self.font:
-            gdi32.DeleteObject(self.font)
-        if self.font_unit:
-            gdi32.DeleteObject(self.font_unit)
+        for f in (self.font, self.font_unit, self.font_num, self.font_icon):
+            if f:
+                gdi32.DeleteObject(f)
         self.font_px = fh
-        self.font = gdi32.CreateFontW(-fh, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 4, 0,
-                                      'Segoe UI Variable Text')
-        # ★2026-10-30: 单位单独用小一号字体（-2px）。
-        #   同字号下 `%`/`°`/`W` 和数字一样大，要么贴死(0px)要么推开(3px)像两个词；
-        #   小一号后可以贴到 1px，既紧凑又一眼能看出是单位 —— 这也是 iStat Menus
-        #   和任务栏时钟的通行做法（主信息大、附属信息小）。
+        SEG = 'Segoe UI Variable Text'
+        self.font = gdi32.CreateFontW(-fh, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 4, 0, SEG)
+        # 单位/标签小一号：同字号下 `%`/`°`/`W` 和数字一样大，贴死会糊、推开像两个词。
+        # 小一号后可以贴到 1px，一眼看出是附属信息（iStat Menus / 任务栏时钟的做法）。
         self.font_unit = gdi32.CreateFontW(-max(8, fh - 2), 0, 0, 0, 400, 0, 0, 0,
-                                           0, 0, 0, 4, 0, 'Segoe UI Variable Text')
+                                           0, 0, 0, 4, 0, SEG)
+        # ★数值用等宽字体(Consolas)：实测 Segoe UI 用空格补位后宽度极差 4~6px，
+        #   Consolas 是 0px —— 只有这样 `9%` 和 `100%` 的 `%` 才真正落在同一像素上。
+        self.font_num = gdi32.CreateFontW(-fh, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 4, 0,
+                                          'Consolas')
+        # 图标字体（Win11 自带 Segoe Fluent Icons）：E950=芯片 E951=温度计
+        self.font_icon = gdi32.CreateFontW(-(fh + 1), 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 4, 0,
+                                           'Segoe Fluent Icons')
+
+    def pick_font(self, role, mono=False):
+        """按角色选字体。"""
+        if role == 'icon':
+            return self.font_icon or self.font
+        if mono and self.font_num:
+            return self.font_num
+        if role in ('unit', 'label') and self.font_unit:
+            return self.font_unit
+        return self.font
 
     # ---- 双缓冲 DIB
     def ensure_buffers(self, wid, hei):
@@ -769,7 +816,11 @@ class Hud(object):
         try:
             self.make_font(hdc, fh)
             gdi32.SelectObject(hdc, self.font)
-            self.widths = [self.measure(hdc, t, r == 'unit') for t, r in self.segs]
+            self.widths = []
+            for s in self.segs:
+                txt, role, mono = s[0], s[1], s[2]
+                fnt = self.pick_font(role, mono)
+                self.widths.append(self.measure(hdc, txt, fnt if fnt is not self.font else None))
             gaps = sum(self.spacing(i, gap) for i in range(1, len(self.segs)))
             wid = max(40, sum(self.widths) + gaps + pad * 2)
         finally:
@@ -783,10 +834,10 @@ class Hud(object):
                               % (tb_h, fh, hei, pad, gap, radius))
                     dbg.write('wid=%d  sum_w=%d  gaps=%d  pad*2=%d\n'
                               % (wid, sum(self.widths), gaps, pad * 2))
-                    for i, (t, r2) in enumerate(self.segs):
-                        dbg.write('%2d %-8r %-6s w=%2d sp=%2d\n'
-                                  % (i, t, r2, self.widths[i],
-                                     self.spacing(i, gap) if i else 0))
+                    for i, s in enumerate(self.segs):
+                        dbg.write('%2d %-8r %-6s w=%2d sp=%2d ref=%r\n'
+                                  % (i, s[0], s[1], self.widths[i],
+                                     self.spacing(i, gap) if i else 0, s[2]))
             except Exception:
                 pass
 
@@ -824,22 +875,22 @@ class Hud(object):
         box = w.RECT(0, 0, 0, hei)
         x = pad
         self.spans = []
-        for i, (txt, role) in enumerate(self.segs):
+        for i, s in enumerate(self.segs):
+            txt, role, mono = s[0], s[1], s[2]
             if i:
                 x += self.spacing(i, gap)
             bw = self.widths[i] if i < len(self.widths) else 0
-            # 单位用小一号字体（见 make_font 注释）
-            fnt = self.font_unit if (role == 'unit' and self.font_unit) else self.font
+            fnt = self.pick_font(role, mono)
             gdi32.SelectObject(self.tmemdc, fnt)
-            box.left, box.right = x, x + bw + 3
+            box.left, box.right = x, x + bw
             user32.DrawTextW(self.tmemdc, txt, -1, ctypes.byref(box),
                              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
             if not pill:
                 gdi32.SelectObject(self.smemdc, fnt)
-                sbox = w.RECT(x + 1, 1, x + bw + 4, hei + 1)
+                sbox = w.RECT(x + 1, 1, x + bw + 1, hei + 1)
                 user32.DrawTextW(self.smemdc, txt, -1, ctypes.byref(sbox),
                                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
-            self.spans.append((x, x + bw + 3, role))
+            self.spans.append((x, x + bw, role))
             x += bw
 
         cov = ctypes.string_at(self.tbits, wid * hei * 4)
@@ -1031,7 +1082,7 @@ class Hud(object):
                 self.nid.hIcon = new
                 if old:
                     user32.DestroyIcon(old)
-        txt = ' '.join(t for t, _r in self.segs)
+        txt = ' '.join(s[0] for s in self.segs)
         self.nid.szTip = ('%s  %s' % (APP_NAME, txt))[:120]
         shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self.nid))
 
