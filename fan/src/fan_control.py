@@ -908,7 +908,7 @@ class FanController(object):
             self._ec_init()
         except Exception as exc:
             self.say("FATAL: EC 初始化失败: %s" % exc)
-            self.say("请以管理员身份运行 fan 目录下的『4-重启风扇服务.bat』(未安装则先跑『1-安装风扇服务.bat』)。详见 fan_service.log")
+            self.say("请以管理员身份运行 fan 目录下的『4-重启风扇服务.bat』(未安装则先跑『1-安装风扇服务.bat』)。详见 logs\\fan_service.log")
             return
         self._control_loop(None, None, None, None)
 

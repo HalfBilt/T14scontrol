@@ -27,11 +27,11 @@ ThinkPad **T14s Gen 4（ES 工程机）** 的常驻控制工具集：两个 SYST
 │   ├── logs\               fan_service.log、fan_control.log
 │   └── 1~4 号 bat          安装 / 卸载 / 状态 / 重启
 ├── hud\            任务栏显示（只读 status\*.json，不碰 EC/MSR，免管理员）
-│   ├── hud.py / hud.json
+│   ├── hud.py / hud.json   hud.json 是本地配置（git 忽略），含位置/字段/主题
 │   ├── logs\               toggle.log（显隐记录）、error.log（异常）、hud_debug.log（调试）
 │   └── 5~7 号 bat          开关 / 关闭 / 解锁并显示
 ├── status\         两个服务每拍写的快照 cpu.json / fan.json（HUD 读它）
-├── _archive\       历史留档：旧脚本备份、一次性迁移工具（不参与运行）
+├── 0-重启后部署.bat  重启后跑一次：风扇服务 + CPU 服务/任务 + HUD + 验证
 └── README.md
 ```
 
@@ -39,12 +39,13 @@ ThinkPad **T14s Gen 4（ES 工程机）** 的常驻控制工具集：两个 SYST
 
 | 目录 | 管什么 | 服务名 | 碰什么 |
 |---|---|---|---|
-| `cpu\` | 功耗墙 + 过热保护 | `CpuPLFixSvc` | MSR `0x610`、MCHBAR+`0x59A0`；EC `0x89~8B` 只读 |
+| `cpu\` | 功耗墙 + 过热保护 | `CpuPLFixSvc` | MSR `0x610`、MCHBAR+`0x59A0`；温度走 ACPI 热区 PDH（回退 EC `0x78`）；EC `0x89~8B` 只读 |
 | `fan\` | 风扇档位 | `T14sFanSvc` | EC `0x2F` 写、`0x84/85` 读 |
 | `hud\` | 任务栏数值显示 | 无（用户态 + 计划任务 `T14sHUDGuard`） | 只读 `status\*.json` |
 
 **温度读取**：两个服务都优先走 **ACPI 热区**（PDH 计数器 `\_TZ.THM0`），对 EC 总线零占用；
 拿不到才退回裸读 EC `0x78`。启动日志会明确打出温度来源。
+（2026-10-23 起；之前直读 `0x78` 会和系统 ACPI 的 `_TMP` 抢字节。）
 
 ## 日志约定
 
@@ -66,6 +67,12 @@ ThinkPad **T14s Gen 4（ES 工程机）** 的常驻控制工具集：两个 SYST
 所有 bat 统一：**UTF-8 无 BOM + `chcp 65001` + `net session` 提权 + 路径三级兜底**
 （`%~dp0..` → `%APPDATA%` → 硬编码），不依赖 `%~dp0` 是否解析成功。
 
+### 顶层
+
+| 脚本 | 作用 |
+|---|---|
+| `0-重启后部署.bat` | 重启后跑一次：装风扇服务 → 补 CPU 服务/任务 → 起 HUD → 验证三者状态 |
+
 ### cpu\（需要管理员）
 
 | 脚本 | 作用 |
@@ -73,7 +80,7 @@ ThinkPad **T14s Gen 4（ES 工程机）** 的常驻控制工具集：两个 SYST
 | `1-安装.bat` | 装驱动 + 服务 + 计划任务，并立即应用一次 28W 功耗墙 |
 | `2-查看状态.bat` | 读真实 MSR/MMIO 功耗墙、温度、频率（只读） |
 | `3-重启服务.bat` | 清 `__pycache__` + 重启 `CpuPLFixSvc` + 打印日志尾部 |
-| `4-卸载.bat` | 删服务、任务、驱动 |
+| `4-卸载.bat` | 删服务、任务、驱动 ⚠️ `TSCtl` 是风扇共用的，删了风扇服务会失效，恢复要重跑 `1-安装.bat` |
 
 ### fan\（1/2/4 需要管理员）
 
@@ -102,12 +109,16 @@ ThinkPad **T14s Gen 4（ES 工程机）** 的常驻控制工具集：两个 SYST
 
 > `runtime\` 不在仓库里（60MB Python 运行时）。新机器先把它放到 `%APPDATA%\T14scontrol\runtime\`。
 
+**重启后**：双击顶层 `0-重启后部署.bat` 一次即可（它会重装风扇服务、补齐 CPU 服务/任务、拉起 HUD 并验证）。
+只跑 `fan\1-安装风扇服务.bat` **不会**装 `TSCtl` 驱动 —— 驱动是 CPU 侧安装的，风扇复用同一份。
+
 ## 要备份的
 
 | 文件 | 说明 |
 |---|---|
 | `cpu\config.json` | 功耗墙 / 过热保护参数（已在仓库里） |
 | `fan\config.json` | 风扇曲线 / 阈值 / 驻留（已在仓库里） |
+| `hud\hud.json` | HUD 位置 / 显示字段 / 主题（**本地文件，不入库**，换机要手动带） |
 
 ## 已知边界
 
@@ -119,6 +130,10 @@ ThinkPad **T14s Gen 4（ES 工程机）** 的常驻控制工具集：两个 SYST
 - 内核驱动从 `C:\Windows\System32\drivers\TSCtl.sys` 加载；服务登记路径每次启动自动校正。
 - **卸载风扇服务时**，若进程 20 秒内没停干净，脚本会拒绝删除并提示重试——
   强删会留下"标记删除"状态（`DeleteFlag=1`，StartType 变 Disabled，报 1058），只能重启清理。
+- **`cpu\4-卸载.bat` 会标记删除共享驱动 `TSCtl`**（重启生效）→ 风扇服务随之失效；
+  风扇安装脚本不装驱动。卸载 CPU 侧后要恢复，跑 `0-重启后部署.bat` 或 `cpu\1-安装.bat`。
+- **计划任务 `\CpuPLFix` 普通权限枚举不到**：`schtasks /query` 可能报拒绝访问、`Get-ScheduledTask` 直接不列。
+  它实际仍在跑（`fix.log` 的 `boot` 行），别据此判断任务丢失。
 
 ## 仓库历史
 

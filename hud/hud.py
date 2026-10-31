@@ -177,7 +177,7 @@ DEFAULT_CFG = {
     'pill': True,
     'labels': 'short',
     'locked': False,          # 锁定拖动（右键菜单仍可用）
-    'click_through': False,   # 点击穿透（鼠标完全穿过，只能用 7-解锁.bat 恢复）
+    'click_through': False,   # 点击穿透（鼠标完全穿过，只能用 7-解锁并显示.bat 恢复）
     'offset_right': 470,
 }
 
@@ -1139,7 +1139,7 @@ class Hud(object):
 
     def apply_lock(self):
         """点击穿透 = WS_EX_TRANSPARENT（鼠标完全穿过）。
-        注意: 穿透后连右键菜单都收不到 —— 只能用 hud\7-解锁.bat 召回来,
+        注意: 穿透后连右键菜单都收不到 —— 只能用 hud\7-解锁并显示.bat 召回来,
         所以它和"锁定拖动"是两个独立开关, 默认都关。"""
         ex = user32.GetWindowLongW(self.hwnd, GWL_EXSTYLE)
         if self.cfg.get('click_through'):
@@ -1207,7 +1207,7 @@ class Hud(object):
     # ---- 菜单
     def menu(self):
         hm = user32.CreatePopupMenu()
-        user32.AppendMenuW(hm, MF_STRING, 100, '隐藏（用 5-开.bat 再显示）' if self.visible else '显示')
+        user32.AppendMenuW(hm, MF_STRING, 100, '隐藏（用 5-任务栏显示-开关.bat 再显示）' if self.visible else '显示')
         user32.AppendMenuW(hm, MF_SEPARATOR, 0, None)
         cur = set(self.cfg['fields'])
         for i, (key, label) in enumerate(FIELDS):
@@ -1232,7 +1232,7 @@ class Hud(object):
         user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if self.cfg.get('locked') else 0),
                            521, '锁定拖动位置')
         user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if self.cfg.get('click_through') else 0),
-                           522, '点击穿透（需 7-解锁.bat 恢复）')
+                           522, '点击穿透（需 7-解锁并显示.bat 恢复）')
         user32.AppendMenuW(hm, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if is_autostart() else 0), 300, '开机自启')
         user32.AppendMenuW(hm, MF_STRING, 301, '恢复默认位置')

@@ -8,7 +8,7 @@
   4) poll_plan 的节奏(凉机 120 秒 / 保护期 5-5-15 / 开机 2-5-10)
   5) MSR 0x610 时间窗解码: _tau_s 与 _pl_time 必须一致(SDM: 8 秒 / 5 秒)
   6) merge_flags: 读失败沿用上一轮、complete=False
-  7) 3-config 的 hold= 同时写 trip_hold_s 与 flag_release_s
+  7) CpuPLFixCfg 的 hold= 同时写 trip_hold_s 与 flag_release_s
 
 跑法:
     "T14scontrol\\cpu\\runtime\\python.exe" dev\\selftest.py
@@ -360,7 +360,7 @@ chk('ec_tripped 跳过 None', cpf.ec_tripped({0x89: None, 0x8A: 0, 0x8B: 0}) == 
 chk('flags_desc 把 None 显示成 --', '--' in cpf.flags_desc({0x89: None, 0x8A: 0, 0x8B: 0}))
 
 # ================================================================ 11. 配置工具
-print('=== 11. 3-config: hold= 同时写 trip_hold_s / flag_release_s ===')
+print('=== 11. CpuPLFixCfg: hold= 同时写 trip_hold_s / flag_release_s ===')
 spec2 = importlib.util.spec_from_file_location(
     'cfgmod', os.path.join(ROOT, 'CpuPLFixCfg.py'))
 m2 = importlib.util.module_from_spec(spec2)

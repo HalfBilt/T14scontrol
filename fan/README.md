@@ -23,7 +23,7 @@
 4-重启风扇服务.bat     重启
 ```
 
-- 日志：`fan_service.log`（服务）/ `fan_control.log`（前台调试模式）
+- 日志：`logs\fan_service.log`（服务）/ `logs\fan_control.log`（前台调试模式）—— 2026-10-31 起统一收进 `logs\`
 - 配置：`config.json`（改完 60 秒内生效，或重启服务）
 - 离线自测：`..\runtime\python.exe src\fan_control.py --selftest`
 
@@ -63,7 +63,8 @@
 
 ## 其余机制
 
-- **曲线输入 = `max(EC 0x78, DTS-6)`**：稳态按 EC 走（不会一直偏吵），冲载时 DTS 提前 5~8 秒顶档
+- **曲线输入 = `max(热区温度, DTS-6)`**：2026-10-23 起温度优先走 **ACPI 热区 `\_TZ.THM0`（PDH 计数器）**，
+  **不占 EC 总线**，拿不到才退回裸读 `0x78`（与热区差 1~2°C）。稳态按热区走（不会一直偏吵），冲载时 DTS 提前 5~8 秒顶档
 - **DTS 快速通道**：MSR `0x1B1` 算封装温度，**≥88°C 连续两拍且 PKG≥25W** 才锁存拉满，
   降到 ≤84°C 解除（比 EC 快 6~13°C）
 - **功耗前馈**：RAPL `MSR 0x611/0x606`，**≥50W 持续 4 秒**抬到 7 档
@@ -100,7 +101,7 @@
 ## 与 CPU 侧工具的关系
 
 `%APPDATA%\T14scontrol\cpu\` 里的 CpuPLFix 负责**功耗墙（MSR/MMIO）+ 过热保护**，
-只读 EC 温度/标志、**不写 EC**；本工具负责**风扇（写 EC 0x2F）**。两边互不写对方的寄存器，
+只读温度/标志、**不写 EC**；本工具负责**风扇（写 EC 0x2F）**。两边互不写对方的寄存器，
 但共用 EC 总线 —— 所以共用同一把 `Global\CpuPLFix-EC` 锁，顺序一致，不会插队。
 
 ## 文件结构
@@ -108,9 +109,13 @@
 ```
 ├── src/            Python 源码（fan_control.py 主程序 / FanControlSvc.py 服务入口 /
 │                   fan_service_ctl.py 服务注册工具）
-（运行时已上移：`..untime\` 与 CPU 侧共用一套）
+├── logs/           fan_service.log（服务）/ fan_control.log（前台调试）
 └── docs/           详细使用说明
 ```
+
+运行时不在本目录：`..\runtime\` 由 CPU / 风扇 / HUD 三个组件共用一套。
+驱动 `TSCtl` 也共用 —— `1-安装风扇服务.bat` **不安装驱动**，驱动没了要先跑
+`..\cpu\1-安装.bat`（或顶层 `0-重启后部署.bat`）。
 
 ## 致谢
 

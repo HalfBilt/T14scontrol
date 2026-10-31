@@ -1,8 +1,7 @@
 # 运行时生成的本地文件
 # config.json 自 2026-10-25 起纳入跟踪（风扇曲线/阈值/驻留，换机器不想重调）
 config.json.broken
-fan_control.log
-fan_control.log.*
+logs/
 __pycache__/
 build/
 dist/
@@ -11,6 +10,4 @@ dist/
 # 本地备份（时间戳后缀，不进仓库）
 *.bak-*
 
-# 捆绑的 Python 运行时（46MB，不进仓库；由部署时复制）
-runtime/
-fan_service.log
+# 捆绑的 Python 运行时不在本目录（..\runtime\ 共用，顶层已忽略）

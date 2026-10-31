@@ -131,7 +131,7 @@ def show(cfg):
     print('  warn_pl2=%g        预警档 PL2 收到这里（PL1 由 warn_pl1 单独设，默认 28W 不动）'
           % g.get('warn_pl2_w', 40.0))
     print()
-    print('改值：3-config.bat ac=40,55   |   撤销：3-config.bat undo   |   全部用法：3-config.bat help')
+    print('改值：CpuPLFixCfg.py ac=40,55   |   撤销：CpuPLFixCfg.py undo   |   全部用法见文件头 docstring')
     print()
 
 
@@ -289,7 +289,7 @@ def apply_kv(cfg, key, val):
         path = {'poll_s': 'poll_s', 'ec_poll': 'ec_poll_s', 'flag_poll': 'flag_poll_s'}[k]
         cfg[path] = _num(val, 1, 600, k)
     else:
-        raise Fail('不认识的项：%s（运行 3-config.bat help 看用法）' % key)
+        raise Fail('不认识的项：%s（用法见 CpuPLFixCfg.py 文件头）' % key)
 
 
 def check(cfg):
@@ -326,7 +326,7 @@ def main(argv):
             cfg = load()
         except Exception as e:
             print('[X] config.json 不是合法 JSON：%s' % e)
-            print('    先运行 3-config.bat undo 恢复上一版')
+            print('    先运行 CpuPLFixCfg.py undo 恢复上一版')
             return 1
     else:
         print('[X] 找不到 %s' % CFG)

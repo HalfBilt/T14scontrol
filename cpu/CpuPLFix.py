@@ -143,7 +143,7 @@ DEFAULT_CFG = {
         "trip_hold_s": 45.0,
         # ★2026-10-20: 温度→功耗调节器("风扇优先"模型)。默认关。
         #   开 = 日常功耗跟着温度走(顶档受 pl1_w 约束), 保护阶梯只在 ≥98°C 接手。
-        #   详见手册 02 §4.5; 3-config.bat tpower=on/off
+        #   详见手册 02 §4.5; CpuPLFixCfg.py tpower=on/off
         "temp_power": False,
         # ★2026-10-19(用户指出后加): 标志档的"温度正常持续一段时间就自动解除"出口。
         #   标志挂着 + 温度连续 <= flag_release_c 达 flag_release_s 秒 -> 判"固件锁存位,
@@ -773,7 +773,7 @@ def _tau_s(t):
       -> 落到这个字节里: Y = bits 1:0, Z = bits 7:6。
       老实现写的是 "Y=低5位, Z=次2位"(ThrottleStop 那种 7 位编码), 于是
       pl1_time=35 被算成 2^3*(1+1/4)=10 秒、pl2_time=66 算成 6 秒 —— 与
-      `_pl_time()`(按 SDM 算: 8 秒 / 5 秒) 自相矛盾, `2-check` 和 `power`
+      `_pl_time()`(按 SDM 算: 8 秒 / 5 秒) 自相矛盾, `2-查看状态` 和 `power`
       两个命令会报出不同的窗口。实测 MSR 0x610=0x004281B800238140:
         PL1 bits16:17=0b11=3, bits22:23=0b00=0 -> 2^3*1.00 = 8 秒
         PL2 bits48:49=0b10=2, bits54:55=0b01=1 -> 2^2*1.25 = 5 秒
@@ -1035,7 +1035,7 @@ _DACL_SECURITY_INFORMATION = 0x00000004
 #   一律 ERROR_ACCESS_DENIED(实测: SYNCHRONIZE / MUTEX_MODIFY_STATE / 两者 / ALL_ACCESS
 #   四种组合全是 err=5; 对照组: 用户进程自己建的名字, 另一个用户进程立刻就能打开)。
 #   后果有两层:
-#     ① 2-check / fan 命令 / 13-EC诊断 / 15-EC延时对照 这些**用户级**工具一把锁都拿不到
+#     ① 2-查看状态 / fan 命令 / 13-EC诊断 / 15-EC延时对照 这些**用户级**工具一把锁都拿不到
 #        -> _ec_lock() 直接返回 False -> 它们**完全不加锁**地和看守服务抢同一对端口,
 #        正是 03 §4 说的插队场景(手册里"跨进程互斥"这条保险对本机其实是失效的);
 #     ② 我们抢先创建的"行业通用那把"(Access_EC)还会让 HWiNFO 之类用户级程序**开不了它**
@@ -1362,7 +1362,7 @@ def ec_bus_stat(hit_bad, retry=False):
 
 
 def ec_bus_stats():
-    """(事务数, 撞车数, 等待毫秒, 读失败数) —— 给 2-check 显示。"""
+    """(事务数, 撞车数, 等待毫秒, 读失败数) —— 给 2-查看状态 显示。"""
     hard = _ECBUS.get('hard') or 0
     soft = _ECBUS.get('soft') or 0
     can = _ECBUS.get('canary') or 0
@@ -1395,7 +1395,7 @@ def ec_bus_report():
         return None                       # 限频: 风暴时别刷屏
     _ECBUS['last_report'] = time.time()
     hits = n_hard + n_soft + n_can
-    # 2026-10-21: bus_report 只影响"写不写日志", 统计照旧(2-check 仍能看撞车率)
+    # 2026-10-21: bus_report 只影响"写不写日志", 统计照旧(2-查看状态 仍能看撞车率)
     _mode = (_ECBUS.get("mode") or "auto")
     if _mode == "off" or (_mode == "auto" and hits == 0):
         return None
@@ -2767,7 +2767,7 @@ def print_version_check(out):
             lt = time.mktime(time.strptime(last, '%Y-%m-%d %H:%M:%S'))
             if mt > lt + 5:
                 stale = ('  [!] 文件比服务启动晚 %.0f 分钟 —— 服务可能还在跑旧代码, '
-                         '跑一次 部署并重启.bat' % ((mt - lt) / 60.0))
+                         '跑一次 3-重启服务.bat' % ((mt - lt) / 60.0))
     except Exception:
         pass
 
@@ -2796,7 +2796,7 @@ def battery_ec_state():
 
 
 def print_battery_check(out):
-    """2-check 里那几行电池状态(Windows 侧 + EC 侧), 外加链路结论。"""
+    """2-查看状态 里那几行电池状态(Windows 侧 + EC 侧), 外加链路结论。"""
     b = battery_flags()
     if b:
         ac_line, bflag, pct = b
@@ -3556,7 +3556,7 @@ def cmd_lock():
 
     2026-10-19: 原来"跨进程互斥"这条保险在本机其实是失效的 —— 命名互斥体默认继承
     **创建者**的默认 DACL, 而看守服务以 SYSTEM 身份创建 -> 用户级进程 OpenMutex 一律
-    ERROR_ACCESS_DENIED(实测四种权限组合全是 err=5), 于是 2-check / fan 命令 /
+    ERROR_ACCESS_DENIED(实测四种权限组合全是 err=5), 于是 2-查看状态 / fan 命令 /
     13-EC诊断 / 15-EC延时对照 这些用户级工具一把锁都没拿到, 等于完全不加锁地和
     看守服务抢同一对端口。现在改成显式给 "Everyone: SYNCHRONIZE|MUTEX_MODIFY_STATE"
     的 DACL, 这个命令就是用来验它的。
