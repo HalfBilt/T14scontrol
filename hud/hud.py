@@ -93,6 +93,15 @@ NIF_TIP = 0x04
 BASE = os.path.dirname(os.path.abspath(__file__))
 STATUS_DIR = os.path.join(os.path.dirname(BASE), 'status')
 CFG_PATH = os.path.join(BASE, 'hud.json')
+# ★2026-10-31: 日志统一收进 hud\logs\（原来散在 hud\ 根目录）
+LOG_DIR = os.path.join(BASE, 'logs')
+
+
+def _ensure_log_dir():
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+    except Exception:
+        pass
 
 FIELDS = [
     ('freq', 'CPU 频率'),
@@ -829,7 +838,8 @@ class Hud(object):
         # 临时诊断：BASE 下放 debug.flag 时把布局明细写出来（排查完就删掉这个分支）
         if os.path.exists(os.path.join(BASE, 'debug.flag')):
             try:
-                with open(os.path.join(BASE, 'hud_debug.log'), 'w', encoding='utf-8') as dbg:
+                _ensure_log_dir()
+                with open(os.path.join(LOG_DIR, 'hud_debug.log'), 'w', encoding='utf-8') as dbg:
                     dbg.write('tb_h=%d fh=%d hei=%d pad=%d gap=%d radius=%d\n'
                               % (tb_h, fh, hei, pad, gap, radius))
                     dbg.write('wid=%d  sum_w=%d  gaps=%d  pad*2=%d\n'
@@ -1088,7 +1098,8 @@ class Hud(object):
 
     def _dbg(self, msg):
         try:
-            with open(os.path.join(BASE, 'toggle.log'), 'a', encoding='utf-8') as fh:
+            _ensure_log_dir()
+            with open(os.path.join(LOG_DIR, 'toggle.log'), 'a', encoding='utf-8') as fh:
                 fh.write('%s %s' % (time.strftime('%H:%M:%S'), msg) + chr(10))
         except Exception:
             pass
@@ -1430,13 +1441,14 @@ def set_autostart(on):
         print('autostart error:', exc)
 
 
-LOG_PATH = os.path.join(BASE, 'error.log')
+LOG_PATH = os.path.join(LOG_DIR, 'error.log')
 
 
 def _log_exc(exc_type, exc, tb):
-    """pythonw 没有控制台：把异常写进 error.log，否则窗口一闪就没、什么都查不到。"""
+    """pythonw 没有控制台：把异常写进 logs/error.log，否则窗口一闪就没、什么都查不到。"""
     try:
         import traceback
+        _ensure_log_dir()
         with open(LOG_PATH, 'a', encoding='utf-8') as fh:
             fh.write('===== %s =====\n' % time.strftime('%Y-%m-%d %H:%M:%S'))
             traceback.print_exception(exc_type, exc, tb, file=fh)

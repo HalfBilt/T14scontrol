@@ -136,7 +136,7 @@ def _worker():
     except Exception as exc:
         import traceback
         try:
-            fan.LOG_PATH  # noqa
+            os.makedirs(fan.LOG_DIR, exist_ok=True)
             with open(fan.LOG_PATH, 'a', encoding='utf-8') as fh:
                 fh.write('服务启动失败: %s\n%s\n' % (exc, traceback.format_exc()))
         except Exception:

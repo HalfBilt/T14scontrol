@@ -9,7 +9,9 @@ __pycache__/
 *.log
 *.log.*
 
-# ---- 本地备份 ----
+# ---- 本地备份 / 归档（不进仓库）----
+_archive/
+_old_bats/
 *.bak-*
 *.bak
 *.broken

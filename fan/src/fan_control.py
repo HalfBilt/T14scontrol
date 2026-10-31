@@ -51,7 +51,9 @@ else:
     APP_DIR = os.path.dirname(SCRIPT_DIR)
 # ★2026-10-20: CPU 侧代码目录 —— 风扇侧复用它的 TSCtl 访问层
 CPU_DIR    = os.path.join(os.path.dirname(APP_DIR), "cpu")
-LOG_PATH   = os.path.join(APP_DIR, "fan_control.log")
+# ★2026-10-31: 日志统一收进 fan\logs\（原来散在 fan\ 根目录）
+LOG_DIR    = os.path.join(APP_DIR, "logs")
+LOG_PATH   = os.path.join(LOG_DIR, "fan_control.log")
 CONF_PATH  = os.path.join(APP_DIR, "config.json")
 
 # ---- 开机自启 (计划任务) -------------------------------------------------
@@ -723,8 +725,12 @@ class FanController(object):
 
     # ---- logging ---------------------------------------------------------
     def _make_logger(self, log_name=None):
-        """log_name=None -> fan_control.log(托盘); 给个名字则写自己的文件(服务)。"""
-        path = LOG_PATH if not log_name else os.path.join(APP_DIR, log_name)
+        """log_name=None -> logs/fan_control.log(托盘); 给个名字则写 logs/ 下的同名文件(服务)。"""
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+        except Exception:
+            pass
+        path = LOG_PATH if not log_name else os.path.join(LOG_DIR, log_name)
         lg = logging.getLogger("fancontrol" + ("." + log_name if log_name else ""))
         lg.setLevel(logging.INFO)
         if not lg.handlers:

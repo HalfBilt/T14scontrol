@@ -82,6 +82,26 @@ def binpath():
     return '"%s" "%s" --service' % (py, os.path.join(BASE, 'FanControlSvc.py'))
 
 
+def _wait_stopped(hs, timeout=20.0):
+    """轮询等待服务进入 STOPPED，返回 True=已完全停止。
+
+    ★2026-10-31 修：原来 uninstall 里 ControlService(STOP) 后只 sleep(1.0) 就
+      DeleteService。服务没停干净时，Windows 会把它标记为"删除待定"
+      （注册表 DeleteFlag=1），此时 StartType 被强制成 Disabled，
+      进程还在跑但再也启动不了（错误 1058），只能重启才能清理。
+      实测 T14sFanSvc 就这样卡死过一次。
+    """
+    buf = SERVICE_STATUS_PROCESS()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        ok = adv.QueryServiceStatusEx(hs, 0, ctypes.byref(buf),
+                                      ctypes.sizeof(buf), None)
+        if ok and buf.dwCurrentState == 1:      # SERVICE_STOPPED
+            return True
+        time.sleep(0.3)
+    return False
+
+
 def do_install():
     bp = binpath()
     if not bp:
@@ -102,7 +122,11 @@ def do_install():
                                       SERVICE_QUERY_STATUS | SERVICE_START)
                 if hs:
                     adv.ControlService(hs, 1, None)      # SERVICE_CONTROL_STOP
-                    time.sleep(1.0)
+                    if not _wait_stopped(hs, 20.0):
+                        print('[!] 旧服务 20 秒内没停干净，暂不重建')
+                        print('    强删会留下"标记删除"状态，之后只能重启才能恢复')
+                        adv.CloseServiceHandle(hs)
+                        return 1
                     adv.DeleteService(hs)
                     adv.CloseServiceHandle(hs)
                     time.sleep(0.5)
@@ -110,6 +134,13 @@ def do_install():
                                         SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
                                         SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, bp,
                                         None, None, None, None, None)
+                if not hs:
+                    err2 = ctypes.get_last_error()
+                    if err2 == 1072:      # ERROR_SERVICE_MARKED_FOR_DELETE
+                        print('[X] 旧服务仍处于"标记删除"状态（DeleteFlag=1）')
+                        print('    Windows 要求进程完全退出才能重建同名服务')
+                        print('    请重启电脑，然后运行 1-安装风扇服务.bat')
+                        return 1
             if not hs:
                 print('[X] CreateService 失败 %d' % ctypes.get_last_error())
                 return 1
@@ -141,7 +172,12 @@ def do_uninstall():
             print('[*] 服务不存在')
             return 0
         adv.ControlService(hs, 1, None)
-        time.sleep(1.0)
+        if not _wait_stopped(hs, 20.0):
+            print('[!] 服务 20 秒内没完全停止，暂不删除')
+            print('    强删会留下"标记删除"状态（StartType 变 Disabled、报 1058）')
+            print('    请稍后重试，或重启后再卸载')
+            adv.CloseServiceHandle(hs)
+            return 1
         adv.DeleteService(hs)
         adv.CloseServiceHandle(hs)
         print('[*] 服务已删除')
