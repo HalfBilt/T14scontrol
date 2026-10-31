@@ -3307,8 +3307,20 @@ def cmd_install():
                             '/xml', tmp, '/f'], capture_output=True, text=True, errors='replace',
                            creationflags=0x08000000)
         ok = p.returncode == 0
-        out('[3/4] 计划任务: %s' % ('已创建(开机/登录/唤醒兜底)' if ok
-                                  else (p.stdout + p.stderr).strip()[:200]))
+        detail = (p.stdout + p.stderr).strip()[:200]
+        # ★2026-10-31: schtasks /create 在本机会返回 0 但任务并未真正落地
+        #   （实测 12:12:47 那次日志写"已创建"，Get-ScheduledTask 全盘搜却找不到，
+        #    System32\Tasks 目录里也没有）。只看返回码会报假成功。
+        #   这里补一次 /query 验证，任务真不在就如实报错。
+        if ok:
+            q = subprocess.run(['C:\\Windows\\System32\\schtasks.exe', '/query', '/tn', TASK_NAME],
+                               capture_output=True, text=True, errors='replace',
+                               creationflags=0x08000000)
+            if q.returncode != 0:
+                ok = False
+                detail = ('创建命令返回成功但任务不存在(rc=0 假成功); query rc=%d %s'
+                          % (q.returncode, (q.stdout + q.stderr).strip()[:120]))
+        out('[3/4] 计划任务: %s' % ('已创建(开机/登录/唤醒兜底)' if ok else detail))
         try:
             os.remove(tmp)
         except Exception:

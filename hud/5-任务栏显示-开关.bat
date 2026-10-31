@@ -1,13 +1,23 @@
 @echo off
-setlocal
-cd /d "%~dp0"
-if exist "%~dp0quit.flag" del /q "%~dp0quit.flag"
-set "PYW=%~dp0..\runtime\pythonw.exe"
-if not exist "%PYW%" (
-    echo [´íÎó] ÕÒ²»µ½¹²ÓÃÔËÐÐÊ±: %PYW%
-    pause
-    exit /b 1
+setlocal EnableExtensions
+chcp 65001 >nul 2>&1
+set "PYTHONIOENCODING=utf-8"
+title HUD - å¼€å…³
+
+rem ========== å®šä½å®‰è£…æ ¹ç›®å½•ï¼ˆä¸‰çº§å…œåº• + è·¯å¾„è§„èŒƒåŒ–ï¼‰==========
+set "ROOT="
+if exist "%~dp0..\runtime\python.exe" for %%A in ("%~dp0..") do set "ROOT=%%~fA"
+if not defined ROOT if exist "%APPDATA%\T14scontrol\runtime\python.exe" set "ROOT=%APPDATA%\T14scontrol"
+if not defined ROOT if exist "C:\Users\Ting\AppData\Roaming\T14scontrol\runtime\python.exe" set "ROOT=C:\Users\Ting\AppData\Roaming\T14scontrol"
+if not defined ROOT (
+  echo [X] æ‰¾ä¸åˆ° runtime\python.exe
+  echo     åº”åœ¨ %%APPDATA%%\T14scontrol\runtime\
+  pause
+  exit /b 1
 )
-rem Ã»ÔÚÔËÐÐ -> Æô¶¯£»ÒÑÔÚÔËÐÐ -> ÇÐ»»ÏÔÊ¾/Òþ²Ø
-start "" "%PYW%" "%~dp0hud.py" --toggle
+set "PY=%ROOT%\runtime\python.exe"
+set "PYW=%ROOT%\runtime\pythonw.exe"
+set "HUDPY=%ROOT%\hud\hud.py"
+if exist "%ROOT%\hud\quit.flag" del /q "%ROOT%\hud\quit.flag"
+start "" "%PYW%" "%HUDPY%" --toggle
 timeout /t 1 >nul

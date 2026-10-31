@@ -1,13 +1,23 @@
 @echo off
-setlocal
-cd /d "%~dp0"
-set "PYW=%~dp0..\runtime\pythonw.exe"
-if not exist "%PYW%" (
-    echo [´íÎó] ÕÒ²»µ½¹²ÓÃÔËÐÐÊ±: %PYW%
-    pause
-    exit /b 1
+setlocal EnableExtensions
+chcp 65001 >nul 2>&1
+set "PYTHONIOENCODING=utf-8"
+title HUD - è§£é”å¹¶æ˜¾ç¤º
+
+rem ========== å®šä½å®‰è£…æ ¹ç›®å½•ï¼ˆä¸‰çº§å…œåº• + è·¯å¾„è§„èŒƒåŒ–ï¼‰==========
+set "ROOT="
+if exist "%~dp0..\runtime\python.exe" for %%A in ("%~dp0..") do set "ROOT=%%~fA"
+if not defined ROOT if exist "%APPDATA%\T14scontrol\runtime\python.exe" set "ROOT=%APPDATA%\T14scontrol"
+if not defined ROOT if exist "C:\Users\Ting\AppData\Roaming\T14scontrol\runtime\python.exe" set "ROOT=C:\Users\Ting\AppData\Roaming\T14scontrol"
+if not defined ROOT (
+  echo [X] æ‰¾ä¸åˆ° runtime\python.exe
+  echo     åº”åœ¨ %%APPDATA%%\T14scontrol\runtime\
+  pause
+  exit /b 1
 )
-rem ¹Øµô"µã»÷´©Í¸"ºÍ"Ëø¶¨ÍÏ¶¯"£¬²¢Ç¿ÖÆÏÔÊ¾
-start "" "%PYW%" "%~dp0hud.py" --cmd unlock
-echo ÒÑ½âËø²¢ÏÔÊ¾£¨Èç¹ûËü±¾À´Ã»ÔÚÔËÐÐ£¬»áÖ±½ÓÆô¶¯£©¡£
+set "PY=%ROOT%\runtime\python.exe"
+set "PYW=%ROOT%\runtime\pythonw.exe"
+set "HUDPY=%ROOT%\hud\hud.py"
+start "" "%PYW%" "%HUDPY%" --cmd unlock
+echo å·²è§£é”å¹¶æ˜¾ç¤ºï¼ˆè‹¥æœ¬æ¥æ²¡è¿è¡Œï¼Œä¼šç›´æŽ¥å¯åŠ¨ï¼‰
 timeout /t 2 >nul

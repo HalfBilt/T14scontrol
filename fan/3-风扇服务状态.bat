@@ -1,17 +1,30 @@
 @echo off
-rem ---- console codepage adaptive: keep Python output readable ----
-for /f "tokens=2 delims=: " %%c in ('chcp') do set "CP=%%c"
-if "%CP%"=="936" set "PYTHONIOENCODING=gbk"
-if "%CP%"=="65001" set "PYTHONIOENCODING=utf-8"
-rem ²é¿´ T14s ·çÉÈ·şÎñ×´Ì¬ + ×î½üÈÕÖ¾(²»ĞèÒª¹ÜÀíÔ±)
-cd /d "%~dp0"
-"%~dp0..\runtime\python.exe" "%~dp0src\fan_service_ctl.py" status
+setlocal EnableExtensions
+chcp 65001 >nul 2>&1
+set "PYTHONIOENCODING=utf-8"
+title é£æ‰‡æœåŠ¡ - çŠ¶æ€
+
+rem ========== å®šä½å®‰è£…æ ¹ç›®å½•ï¼ˆä¸‰çº§å…œåº• + è·¯å¾„è§„èŒƒåŒ–ï¼‰==========
+set "ROOT="
+if exist "%~dp0..\runtime\python.exe" for %%A in ("%~dp0..") do set "ROOT=%%~fA"
+if not defined ROOT if exist "%APPDATA%\T14scontrol\runtime\python.exe" set "ROOT=%APPDATA%\T14scontrol"
+if not defined ROOT if exist "C:\Users\Ting\AppData\Roaming\T14scontrol\runtime\python.exe" set "ROOT=C:\Users\Ting\AppData\Roaming\T14scontrol"
+if not defined ROOT (
+  echo [X] æ‰¾ä¸åˆ° runtime\python.exe
+  echo     åº”åœ¨ %%APPDATA%%\T14scontrol\runtime\
+  pause
+  exit /b 1
+)
+set "PY=%ROOT%\runtime\python.exe"
+set "PYW=%ROOT%\runtime\pythonw.exe"
+set "FANCTL=%ROOT%\fan\src\fan_service_ctl.py"set "FANLOG=%ROOT%\fan\fan_service.log"
+"%PY%" "%FANCTL%" status
 echo.
-if exist "%~dp0fan_service.log" (
-  echo ==== fan_service.log ×î½ü 25 ĞĞ ====
-  powershell -NoProfile -Command "Get-Content -LiteralPath '%~dp0fan_service.log' -Encoding UTF8 -Tail 25"
+if exist "%FANLOG%" (
+  echo ---- æœ€è¿‘ 25 è¡Œæ—¥å¿— ----
+  powershell -NoProfile -Command "Get-Content -LiteralPath '%FANLOG%' -Encoding UTF8 -Tail 25"
 ) else (
-  echo (»¹Ã»ÓĞ fan_service.log)
+  echo è¿˜æ²¡æœ‰æ—¥å¿—æ–‡ä»¶: %FANLOG%
 )
 echo.
 pause
