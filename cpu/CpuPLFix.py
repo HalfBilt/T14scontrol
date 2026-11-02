@@ -2267,6 +2267,56 @@ def do_hibernate():
         return False
 
 
+# ---- PROCHOT 监视 (2026-11-02) -------------------------------------------
+# "掉到 0.4GHz / 卡顿"除了"固件把 PL1 写低"之外, 还有一条完全独立的路: 外部 BD PROCHOT。
+# EC / 充电器 / 电池 BMS 任一拉低 PROCHOT# 针脚, CPU 就掉到最低倍频 —— 不管温度多低、
+# 功耗墙设多少。只修 PL1 修不好这类卡顿, 因为两条路互不相干。
+# MSR 是 CPU 内部寄存器, 读它不碰 EC, 代价近似零, 所以每拍都可以读。
+_MSR_THERM_STATUS = 0x19C
+_MSR_PKG_THERM_STATUS = 0x1B1
+_MSR_LIMIT_REASONS = 0x64F
+_PH = {'active': None, 'seen_log': False}
+
+
+def _ph_log(line):
+    try:
+        with open(os.path.join(LOG_DIR, 'prochot.log'), 'a', encoding='utf-8') as fh:
+            fh.write('%s  %s\n' % (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), line))
+    except Exception:
+        pass
+
+
+def prochot_probe():
+    """读 PROCHOT 状态, 跳变时追加 logs\\prochot.log。
+
+    Intel SDM 判据:
+      IA32_THERM_STATUS(0x19C)     bit2 = PROCHOT#/FORCEPR# 正在被外部拉低
+                                   bit3 = 本次开机后曾经被拉低过
+      IA32_PKG_THERM_STATUS(0x1B1) 同为封装级
+      CORE_PERF_LIMIT_REASONS(0x64F) bit16 = PROCHOT 历史位
+    """
+    t = rdmsr(_MSR_THERM_STATUS)
+    if t is None:
+        return
+    pk = rdmsr(_MSR_PKG_THERM_STATUS) or 0
+    lr = rdmsr(_MSR_LIMIT_REASONS) or 0
+    act = (t >> 2) & 1
+    logged = (t >> 3) & 1
+    ratio = (rdmsr(MSR_PERF_STATUS) or 0) >> 8 & 0xFF
+    st = 'AC' if on_ac() else 'BAT'
+    if act != _PH['active']:
+        if act:
+            _ph_log('PROCHOT 被外部拉低 -> %d MHz (%s)  温度 EC=%s DTS=%s  封装级bit2=%d  reasons=0x%X'
+                    % (ratio * 100, st, _G.get('last_et'), _G.get('last_dts'), (pk >> 2) & 1, lr))
+        elif _PH['active']:
+            _ph_log('PROCHOT 解除 -> %d MHz (%s)  reasons=0x%X' % (ratio * 100, st, lr))
+        _PH['active'] = act
+    if logged and not _PH['seen_log']:
+        _PH['seen_log'] = True
+        if not act:
+            _ph_log('PROCHOT 历史位已置位(本次开机后曾被外部拉低, 现已恢复)  reasons=0x%X' % lr)
+
+
 def tick(cfg=None, ec=True, read_flags=True):
     """看守服务/计划任务每轮调一次: (读 EC) -> 过热保护 -> 功耗墙。
     返回本轮变化描述列表(调用方负责记日志)。
@@ -2280,6 +2330,10 @@ def tick(cfg=None, ec=True, read_flags=True):
     notes = []
     if not ensure_driver(verbose=False):
         return notes
+    try:
+        prochot_probe()          # MSR 不碰 EC, 见函数注释
+    except Exception:
+        pass
     prev = _G.get('last_et')
     et = prev                            # ec=False 时也走这个初始值
     if ec:
