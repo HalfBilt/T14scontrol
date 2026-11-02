@@ -107,10 +107,22 @@ ThinkPad **T14s Gen 4（ES 工程机）** 的常驻控制工具集：两个 SYST
 2. 风扇侧：双击 `fan\1-安装风扇服务.bat`
 3. 任务栏：双击 `hud\5-任务栏显示-开关.bat`
 
-> `runtime\` 不在仓库里（60MB Python 运行时）。新机器先把它放到 `%APPDATA%\T14scontrol\runtime\`。
+> `runtime\` 不在仓库里（**实测 42.2 MB / 1354 个文件**，Python 3.13.14 x64）。新机器先把它放到
+> `%APPDATA%\T14scontrol\runtime\`：装一份官方 Python 3.13 x64（`winget install Python.Python.3.13`
+> 或 python.org 安装包），把安装目录里的 `python.exe`、`pythonw.exe`、`python3.dll`、`python313.dll`、
+> `vcruntime140*.dll`、`DLLs\`、`Lib\` 拷进去即可。代码只用标准库（ctypes/json/logging/socket 等），
+> **不需要任何第三方包**。验证：`runtime\python.exe -c "import ctypes,json,logging;print('ok')"` 打印 `ok`。
 
 **重启后**：双击顶层 `0-重启后部署.bat` 一次即可（它会重装风扇服务、补齐 CPU 服务/任务、拉起 HUD 并验证）。
 只跑 `fan\1-安装风扇服务.bat` **不会**装 `TSCtl` 驱动 —— 驱动是 CPU 侧安装的，风扇复用同一份。
+
+## 随包的驱动 `TSCtl.sys`
+
+`cpu\TSCtl.sys`（52 KB）是从 ThrottleStop 的 exe 资源里**原样提取、未修改**的低层驱动，安装时复制到
+`C:\Windows\System32\drivers\` 并注册成按需启动的服务 `TSCtl`。
+**可复核**：`Get-AuthenticodeSignature` → `Valid` / `CN=TechPowerUp LLC` / 版本 `3.0.0.0`。
+随包保存的唯一理由是**重装系统时不用再去找一份同版本**；它由原厂签名，本仓库不再分发任何改动版本，
+也不对其授权与用途作任何声明或保证。
 
 ## 要备份的
 

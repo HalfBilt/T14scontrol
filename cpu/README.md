@@ -172,6 +172,9 @@ Windows 服务，启动类型「自动」，由服务控制管理器在开机早
 读写 MSR 和物理内存必须有内核驱动。本工具**已内置** `TSCtl.sys`，安装时复制到工具目录
 并注册成服务 `TSCtl`，之后由计划任务按需拉起。
 
+**可复核的事实**：`Get-AuthenticodeSignature cpu\TSCtl.sys` → 状态 `Valid`、签名主体 `CN=TechPowerUp LLC`、
+文件版本 `3.0.0.0`（ProductName `Low-Level Driver`）。
+
 这个驱动来自 ThrottleStop（作者 Kevin Glynn）——ThrottleStop 把它作为资源内嵌在自己的
 exe 里，本工具按 PE 结构把 x64 镜像连同 Authenticode 签名一起提取出来，一个字节都没改，
 只换了个文件名（否则会和 ThrottleStop 自己的设备名冲突）。选它是因为它是少数既能通过
