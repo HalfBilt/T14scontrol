@@ -13,6 +13,7 @@ ThinkPad **T14s Gen 4（ES 工程机）** 的常驻控制工具集：两个 SYST
 ```
 %APPDATA%\T14scontrol\
 ├── runtime\        共用 Python 3.13（三个组件都跑它，别再各带一份）
+├── heartbeat.py    断电黑匣子：每 30 秒写 logs\heartbeat.log（登录自启）
 ├── cpu\            CpuPLFix   —— 功耗墙 + 过热保护（MSR/MMIO）
 │   ├── CpuPLFix.py         主程序
 │   ├── CpuPLFixSvc.py      服务入口
