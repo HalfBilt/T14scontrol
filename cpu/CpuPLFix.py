@@ -2317,6 +2317,52 @@ def prochot_probe():
             _ph_log('PROCHOT 历史位已置位(本次开机后曾被外部拉低, 现已恢复)  reasons=0x%X' % lr)
 
 
+# ---- 电池空白自愈 (2026-11-02) -------------------------------------------
+# 连续 3 拍读到无效值才动手(偶发一次不折腾), 冷却 15 分钟(避免反复重启设备)。
+_BATT = {'bad': 0, 'last_fix': 0.0}
+
+
+def _batt_log(line):
+    try:
+        with open(os.path.join(LOG_DIR, 'battery.log'), 'a', encoding='utf-8') as fh:
+            fh.write('%s  %s\n' % (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), line))
+    except Exception:
+        pass
+
+
+def battery_recover(bflag, pct):
+    """电池读数无效时重启 ACPI 电池设备, 强制 EC 重新读 _BST/_BIA。
+
+    返回要记进日志的一句话(成功时), 否则 None。
+    """
+    _BATT['bad'] += 1
+    if _BATT['bad'] < 3:
+        return None
+    now = time.time()
+    if now - _BATT['last_fix'] < 900:
+        return None
+    _BATT['last_fix'] = now
+    _BATT['bad'] = 0
+    import subprocess
+    _batt_log('读数无效(BatteryFlag=%s 电量=%s%%) -> 重启 ACPI 电池设备让 EC 重读' % (bflag, pct))
+    ok = False
+    for inst in (r'ACPI\PNP0C0A\0', r'ACPI\PNP0C0A\1'):
+        try:
+            r = subprocess.run(['pnputil.exe', '/restart-device', inst],
+                               capture_output=True, timeout=20,
+                               creationflags=0x08000000)
+            if r.returncode == 0:
+                ok = True
+                break
+        except Exception as e:
+            _batt_log('  pnputil 调用异常: %s' % e)
+    time.sleep(1.5)
+    b2 = battery_flags()
+    _batt_log('  %s; 之后读数: BatteryFlag=%s 电量=%s%%'
+              % ('成功' if ok else '失败', b2[1] if b2 else '?', b2[2] if b2 else '?'))
+    return '电池读数无效, 已重启电池设备(强制 EC 重读): %s' % ('成功' if ok else '失败')
+
+
 def tick(cfg=None, ec=True, read_flags=True):
     """看守服务/计划任务每轮调一次: (读 EC) -> 过热保护 -> 功耗墙。
     返回本轮变化描述列表(调用方负责记日志)。
@@ -2410,16 +2456,27 @@ def tick(cfg=None, ec=True, read_flags=True):
     # ---- ★电池链路看门狗(2026-10-19 加) -----------------------------------------
     # 那天 ACPI 电池数据全变成 0xFFFFFFFF(设计/满充 = -1 mWh), 工具全程无感, 是用户
     # 自己发现"电池显示 -1"。GetSystemPowerStatus 不碰 EC、不花代价, 所以每轮都查。
+    # ---- ★电池空白自愈(2026-11-02 加) -------------------------------------------
+    # 用户反馈: 有时开机后电池直接显示空白。这是 ACPI _BST/_BIA 那条路断了, 与
+    # "EC 不稳定"同源。Windows 侧唯一的复位手段是让 ACPI 电池设备重新枚举 ——
+    # 2026-11-02 实测 `pnputil /restart-device ACPI\PNP0C0A\0` 返回 0,
+    # 重启后电压立刻被重新读一次(17154 -> 17061 -> 17155), 设备仍为 OK, 无副作用。
     b = battery_flags()
     if b is not None:
         ac_line, bflag, pct = b
         if bflag in (128, 255) or pct == 255:
             m = _note_once('battery_gone',
                            '注意: 电池读数异常(ACPI BatteryFlag=%s, 电量=%s%%) —— 典型的 EC/电池'
-                           '链路失联(电池报告会显示 -1 mWh)。别拔适配器; 处置: 关机 -> 拔适配器'
-                           '-> 长按电源键 30 秒 -> 插回开机(手册 03 §9)。' % (bflag, pct))
+                           '链路失联(电池报告会显示 -1 mWh)。别拔适配器; 本工具会自动重启电池'
+                           '设备让 EC 重读; 仍不行再 关机 -> 拔适配器 -> 长按电源键 30 秒 -> 插回'
+                           '开机(手册 03 §8)。' % (bflag, pct))
             if m:
                 notes.append(m)
+            n = battery_recover(bflag, pct)
+            if n:
+                notes.append(n)
+        else:
+            _BATT['bad'] = 0
     if _G['hibernate']:
         _G['hibernate'] = False
         do_hibernate()
