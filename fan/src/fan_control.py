@@ -830,23 +830,11 @@ class FanController(object):
                              % (raw, self._ec_bad))
             self._ec_t = now
 
-            # 转速 + HFSP 核对
-            #   本机固件 OWAK() 里有 If(SCRM) HFSP=0x07, 唤醒后会抢回档位,
-            #   不核对的话工具会一直以为还是原来那档, 再也不重写。
-            #
-            # ★2026-10-20(托盘对不上): 原来固定"每 6 次 EC 读"(约 30 秒)读一次转速,
-            #   而 0x40 从写下去到爬稳要 20~25 秒 —— 托盘上那 30 秒显示的是**换档前**的转速,
-            #   看着就像"点了满速没反应"。改成: 换档后 35 秒内跟着温度一起读(每 5 秒),
-            #   平时仍是 30 秒一次(不增加 EC 总线负担)。
-            interval = self._ec_cycle if now < self._rpm_fast_until else 30.0
-            if self._rpm is None or now - self._rpm_t >= interval:
-                try:
-                    v = self.ec.rpm()
-                    if v is not None:       # 读失败保留上一次转速, 别让 HUD 闪成 ----
-                        self._rpm = v
-                        self._rpm_t = now
-                except Exception:
-                    pass
+            # ★2026-11-02: 不再读转速(0x84/0x85)。实测它只服务 HUD 显示, 每小时却要
+            #   480 笔 EC 事务(30 秒一次 × 2 寄存器 × 两次一致校验; 换档后 35 秒内每 5 秒)。
+            #   用户已关掉 HUD 的风扇转速字段, 所以这条路整条撤掉。
+            #   连带效果: self._rpm 恒为 None -> fan.json 的 rpm 为 null、日志打 RPM=--;
+            #   控制逻辑(曲线只吃温度/DTS/功耗)不受影响。
         return self._ec_temp, self._rpm
 
     def _guard_hfsp(self, want):
