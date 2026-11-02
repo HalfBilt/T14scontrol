@@ -26,8 +26,8 @@ FanControl -- ThinkPad T14s Gen 4 智能风扇控制
     (3/4/5 档实测都挤在 ~3180 RPM, 没有中间档的意义, 直接跳过)
 
 用法:
-  pythonw fan_control.py            常规启动 (托盘图标)
-  python  fan_control.py --console  带控制台日志启动
+  pythonw FanControlSvc.py          服务模式 (SCM 拉起, SYSTEM, 不依赖登录)
+  python  fan_control.py --console  带控制台日志启动 (调试用, 需管理员)
   python  fan_control.py --selftest 只测曲线/前馈/温度换算逻辑, 不碰 EC
 """
 
