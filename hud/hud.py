@@ -108,8 +108,7 @@ FIELDS = [
     ('cpu', 'CPU 占用'),
     ('temp', 'EC 温度'),
     ('dts', 'DTS 温度'),
-    ('fan', '风扇转速'),
-    ('gear', '风扇档位'),
+    ('gear', '风扇转速'),
     ('pkg', '封装功率'),
     ('pl', '功耗墙 PL1/PL2'),
     ('mem', '内存占用'),
@@ -139,6 +138,12 @@ FIELD_W = {
     'fan': 4, 'gear': 4, 'pkg': 2, 'pl': 5,
     'mem': 3, 'batt': 3,
 }
+
+# ★2026-11-02 档位 -> 标称转速（本机实测标定，与 fan/src/fan_control.py 的 LEVEL_RPM 同源）。
+#   HUD 显示转速用的是**我们写下去的档位**换算出来的标称值，不再去读 EC 0x84/0x85
+#   （那次读取只服务显示，却要 480 笔 EC 事务/小时）。
+#   注意这是"低温柔表"值：0x06/0x07 在热态会上浮到 ~3880/~4380，显示会偏低一点。
+GEAR_RPM = {1: 2471, 2: 2858, 3: 3181, 4: 3186, 5: 3167, 6: 3456, 7: 3858, 64: 4807}
 
 # Segoe Fluent Icons（Win11 自带）。实测 E950 是芯片、E951 是温度计。
 ICON_CPU = '\uE950'
@@ -555,7 +560,13 @@ def collect(cfg):
                 add(None, 'AUTO', 'dim')
             else:
                 n = v & 0x7F
-                add(None, 'OFF' if n == 0 else ('FULL' if n >= 0x40 else 'L%d' % n), 'fg')
+                if n == 0:
+                    add(None, 'OFF', 'dim')
+                else:
+                    rpm = GEAR_RPM.get(n)
+                    # 显示标称转速而不是档位号：档位是我们自己写的，转速由它查表得出，
+                    # 不需要再读 EC（见 GEAR_RPM 注释）。
+                    add(None, ('%d' % rpm) if rpm else ('FULL' if n >= 0x40 else 'L%d' % n), 'fg')
         elif f == 'pkg':
             v = fan.get('pkg')
             lb = 'PKG' if mode == 'full' else None
