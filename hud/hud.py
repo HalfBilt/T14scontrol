@@ -80,6 +80,7 @@ TPM_RIGHTBUTTON = 0x0002
 MF_STRING = 0x0000
 MF_CHECKED = 0x0008
 MF_SEPARATOR = 0x0800
+MF_POPUP = 0x00000010
 
 HWND_TOPMOST = -1
 ABM_GETTASKBARPOS = 5
@@ -151,6 +152,30 @@ ICON_TEMP = '\uE951'
 
 SEP_CHAR = '\u00b7'          # 圆点：比 `│`(9px 宽)轻，13px 下不抢戏
 
+# ★2026-11-03 字段淡色：常态不是纯白，每个量带一点自己的色相（饱和度很低）。
+#   参考 iStat Menus / TrafficMonitor 的思路：底色克制、只靠极轻的色相区分通道，
+#   真正要"跳出来"的只有越界告警。RGB 写，绘图前反转成 BGR。
+TINTS_RGB = {
+    'dark': {
+        'freq': (226, 232, 244), 'cpu': (224, 240, 230), 'temp': (244, 230, 218),
+        'dts': (240, 226, 220), 'gear': (220, 238, 240), 'pkg': (242, 232, 214),
+        'pl': (230, 226, 244), 'mem': (226, 234, 242), 'batt': (232, 240, 222),
+    },
+    'light': {
+        'freq': (34, 44, 62), 'cpu': (28, 58, 44), 'temp': (66, 44, 30),
+        'dts': (64, 40, 32), 'gear': (18, 52, 58), 'pkg': (62, 48, 26),
+        'pl': (44, 38, 66), 'mem': (30, 44, 56), 'batt': (40, 54, 26),
+    },
+}
+
+
+def tint_bgr(name, theme='dark'):
+    rgb = TINTS_RGB.get(theme, TINTS_RGB['dark']).get(name)
+    if not rgb:
+        return None
+    return (rgb[2], rgb[1], rgb[0])
+
+
 # 分级阈值：(注意, 警告)。常态一律中性白，越过才上暖黄/红 —— 参考 iStat Menus 的做法
 LEVELS = {
     'temp': (80, 90),      # EC 温度
@@ -160,6 +185,18 @@ LEVELS = {
     'mem': (85, 95),       # 内存占用 %
     'batt': (25, 10),      # 电池反比：低于 25 黄、10 红
 }
+
+
+def norm_fields(fields):
+    """把配置里的字段列表收敛成合法集合（按 FIELDS 顺序）。
+
+    2026-11-03: 原来 251「只留 频率/温度/风扇」写的是 ['freq','temp','fan'] ——
+    'fan' 早已改名 'gear'，于是点完只剩频率和温度、风扇直接消失，非法字段还被写回 hud.json。
+    任何写 cfg['fields'] 的地方都必须过这个函数。
+    """
+    known = {k for k, _l in FIELDS}
+    keep = set(fields or [])
+    return [k for k, _l in FIELDS if k in keep and k in known]
 
 
 def level_role(key, value):
@@ -174,7 +211,7 @@ def level_role(key, value):
 
 DEFAULT_CFG = {
     'enabled': True,
-    'fields': ['freq', 'cpu', 'temp', 'fan'],
+    'fields': ['freq', 'cpu', 'temp', 'gear'],
     'x': None,
     'y': None,
     'scale': 1.0,
@@ -505,7 +542,11 @@ def collect(cfg):
         if label:
             # E000 以上是图标字符 -> 用图标字体；普通文字用小一号
             segs.append((label, 'icon' if ord(label[0]) >= 0xE000 else 'label', False))
-        if not w and role in ('fg', 'dim', 'hot1', 'hot2'):
+        if role == 'fg':
+            t = tint_bgr(_cur['f'])
+            if t is not None:
+                role = 'fld:' + _cur['f']           # 常态数值带极淡的字段色相
+        if not w and (role in ('fg', 'dim', 'hot1', 'hot2') or role.startswith('fld:')):
             w = FIELD_W.get(_cur['f'], 0)           # 数值段自动补位
         if w:
             # 等宽补位：'9' -> '  9'，这样后面的 `%`/`°` 位置恒定
@@ -577,7 +618,19 @@ def collect(cfg):
         elif f == 'pl':
             lb = 'PL' if mode == 'full' else None
             if cpu.get('pl1'):
-                add(lb, '%d/%d' % (round(cpu['pl1']), round(cpu.get('pl2') or 0)), 'dim', 'W')
+                # 2026-11-03: 功耗墙被压时直接上色，不用去翻日志。
+                lv = (cpu.get('level') or '').lower()
+                sp = SYSTEM_POWER_STATUS()
+                onac = bool(kernel32.GetSystemPowerStatus(ctypes.byref(sp))) and sp.ACLineStatus == 1
+                if lv in ('crit', 'crit2', 'crit3', 'trip', 'escape'):
+                    role = 'hot2'      # 保护在压：红
+                elif lv:
+                    role = 'hot1'      # 有级别但没到最高：橙
+                elif onac and float(cpu['pl1']) < 27.5:
+                    role = 'hot1'      # 插着电却被压到 PBP 28W 以下 = 异常
+                else:
+                    role = 'fg'        # 电池档 20/28W 是正常策略，不上色
+                add(lb, '%d/%d' % (round(cpu['pl1']), round(cpu.get('pl2') or 0)), role, 'W')
             else:
                 add(lb, '--/--', 'dim')
         elif f == 'mem':
@@ -933,6 +986,11 @@ class Hud(object):
             return dx * dx + dy * dy <= r * r
 
         colors = {k: pal[k] for k in ('fg', 'dim', 'sep', 'label', 'unit')}
+        _th = 'light' if pal is PALETTE['light'] else 'dark'   # 用已解析好的调色板反推主题名
+        for _f in ('freq', 'cpu', 'temp', 'dts', 'gear', 'pkg', 'pl', 'mem', 'batt'):
+            _c = tint_bgr(_f, _th)
+            if _c is not None:
+                colors['fld:' + _f] = _c
         hot = dict(pal['hot'])
         out = bytearray(wid * hei * 4)
 
@@ -1217,36 +1275,44 @@ class Hud(object):
 
     # ---- 菜单
     def menu(self):
+        # 2026-11-03 精简：原来一屏 30 多项，字段/尺寸/外观/标签全平铺。
+        # 现在各收进一个子菜单，顶层只剩 9 条。AppendMenuW 的 uIDNewItem 已按 c_size_t
+        # 声明，传子菜单句柄在 64 位下是安全的。
+        def sub(items):
+            m = user32.CreatePopupMenu()
+            for text, mid, checked in items:
+                user32.AppendMenuW(m, MF_STRING | (MF_CHECKED if checked else 0), mid, text)
+            return m
+
         hm = user32.CreatePopupMenu()
-        user32.AppendMenuW(hm, MF_STRING, 100, '隐藏（用 5-任务栏显示-开关.bat 再显示）' if self.visible else '显示')
+        user32.AppendMenuW(hm, MF_STRING, 100,
+                           '隐藏（用 5-任务栏显示-开关.bat 再显示）' if self.visible else '显示')
         user32.AppendMenuW(hm, MF_SEPARATOR, 0, None)
         cur = set(self.cfg['fields'])
-        for i, (key, label) in enumerate(FIELDS):
-            user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if key in cur else 0), 200 + i, label)
-        user32.AppendMenuW(hm, MF_STRING, 250, '全部显示')
-        user32.AppendMenuW(hm, MF_STRING, 251, '只留 频率/温度/风扇')
-        lm = self.cfg.get('labels') or 'short'
-        for i, (label, val) in enumerate((('完整', 'full'), ('简短', 'short'), ('隐藏', 'none'))):
-            user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if lm == val else 0),
-                               530 + i, '标签: ' + label)
-        user32.AppendMenuW(hm, MF_SEPARATOR, 0, None)
+        user32.AppendMenuW(hm, MF_STRING, 251, '精简：频率 · 温度 · 风扇')
+        user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if len(cur) >= len(FIELDS) else 0),
+                           250, '全套')
+        user32.AppendMenuW(hm, MF_POPUP,
+                           sub([(lb, 200 + i, k in cur) for i, (k, lb) in enumerate(FIELDS)]),
+                           '显示项')
         sc = float(self.cfg.get('scale') or 1.0)
-        for i, (label, val) in enumerate(SCALES):
-            user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if abs(sc - val) < 0.02 else 0),
-                               500 + i, '尺寸: ' + label)
+        user32.AppendMenuW(hm, MF_POPUP,
+                           sub([(lb, 500 + i, abs(sc - v) < 0.02) for i, (lb, v) in enumerate(SCALES)]),
+                           '尺寸')
         theme = self.cfg.get('theme') or 'auto'
-        for i, (label, val) in enumerate((('跟随系统', 'auto'), ('深色', 'dark'), ('浅色', 'light'))):
-            user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if theme == val else 0),
-                               510 + i, '外观: ' + label)
-        user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if self.cfg.get('pill', True) else 0),
-                           520, '底框')
-        user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if self.cfg.get('locked') else 0),
-                           521, '锁定拖动位置')
-        user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if self.cfg.get('click_through') else 0),
-                           522, '点击穿透（需 7-解锁并显示.bat 恢复）')
+        user32.AppendMenuW(hm, MF_POPUP,
+                           sub([(lb, 510 + i, theme == v) for i, (lb, v) in
+                                enumerate((('跟随系统', 'auto'), ('深色', 'dark'), ('浅色', 'light')))]),
+                           '外观')
+        lm = self.cfg.get('labels') or 'short'
+        user32.AppendMenuW(hm, MF_POPUP,
+                           sub([(lb, 530 + i, lm == v) for i, (lb, v) in
+                                enumerate((('完整', 'full'), ('简短', 'short'), ('隐藏', 'none')))]),
+                           '标签')
         user32.AppendMenuW(hm, MF_SEPARATOR, 0, None)
+        user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if self.cfg.get('pill', True) else 0), 520, '底框')
+        user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if self.cfg.get('locked') else 0), 521, '锁定位置')
         user32.AppendMenuW(hm, MF_STRING | (MF_CHECKED if is_autostart() else 0), 300, '开机自启')
-        user32.AppendMenuW(hm, MF_STRING, 301, '恢复默认位置')
         user32.AppendMenuW(hm, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(hm, MF_STRING, 400, '退出')
 
@@ -1268,15 +1334,15 @@ class Hud(object):
                     f.remove(key)
             else:
                 f.append(key)
-            self.cfg['fields'] = [k for k, _l in FIELDS if k in f]
+            self.cfg['fields'] = norm_fields(f)
             save_cfg(self.cfg)
             self.refresh()
         elif cmd == 250:
-            self.cfg['fields'] = [k for k, _l in FIELDS]
+            self.cfg['fields'] = norm_fields([k for k, _l in FIELDS])
             save_cfg(self.cfg)
             self.refresh()
         elif cmd == 251:
-            self.cfg['fields'] = ['freq', 'temp', 'fan']
+            self.cfg['fields'] = norm_fields(['freq', 'temp', 'gear'])
             save_cfg(self.cfg)
             self.refresh()
         elif 530 <= cmd < 533:
@@ -1511,6 +1577,8 @@ def main():
     threading.Thread(target=_cpu_sample_loop, daemon=True, name='cpu-sample').start()
 
     cfg = load_cfg()
+
+    cfg['fields'] = norm_fields(cfg.get('fields') or [])
     if '--reset' in sys.argv:
         cfg['x'] = cfg['y'] = None
         save_cfg(cfg)
